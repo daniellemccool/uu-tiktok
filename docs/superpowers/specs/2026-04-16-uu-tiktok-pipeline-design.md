@@ -132,7 +132,8 @@ uu-tiktok/
 │   ├── transcribe.rs         # whisper.cpp invocation, language detection, output writing
 │   ├── pipeline.rs           # The pipelined orchestrator (download workers, channel, transcribe worker)
 │   ├── output/
-│   │   ├── artifacts.rs      # Per-video atomic writes
+│   │   ├── mod.rs            # shard_path() helper used by all callers; nothing hard-codes paths
+│   │   ├── artifacts.rs      # Per-video atomic writes (sharded sibling-suffix tmp)
 │   │   └── manifest.rs       # One-shot parquet export
 │   ├── process.rs            # Shared subprocess runner (spawn, timeout, stderr ring buffer)
 │   └── errors.rs             # RetryableKind, UnavailableReason, ClassifiedFailure, FailureContext
@@ -231,7 +232,7 @@ uu-tiktok/
 
 3. **`canonical::canonicalize_url`** — pure function, no I/O. Returns `CanonicalVideoId(String)` for forms 1 and 2 (regex extracts the 19-digit ID), `NeedsResolution(Url)` for short links (forms 3 and 4). The dedup primitive; gets the heaviest test coverage. Short-link rows do not enter `videos` directly — they go to `pending_resolutions` and are resolved by a pre-flight step (see Data flow).
 
-4. **`output` module** — every artifact write is atomic (write to `.tmp`, fsync, rename, fsync parent dir). Crash-safety guarantee: a transcript file on disk is always complete; a partially-written file would be the `.tmp` and the SQLite row would still be `in_progress`, so the next run re-does that video.
+4. **`output` module** — every artifact write is atomic (write to sibling `.tmp` in the shard directory, fsync, rename in-place, fsync shard dir). All callers route paths through `shard_path(video_id)` so the on-disk layout (sharded by last two digits of `video_id`) is enforced in one place. Crash-safety guarantee: a transcript file on disk is always complete; a partially-written file would be the `.tmp` (cleaned up at next startup) and the SQLite row would still be `in_progress`, so the next run re-does that video.
 
 5. **`config::Config`** — single resolved struct passed everywhere. CLI + env + profile defaults are merged exactly once, in `main`. No module reads env vars or argv directly.
 
@@ -521,11 +522,38 @@ INSERT INTO meta (key, value) VALUES ('schema_version', '1');
 
 `attempt_count` semantics: incremented inside the `claim_next` transaction (i.e., once per transition into `in_progress`). Counts attempts, not failures. Stale-claim recovery does **not** bump `attempt_count` (the count was already incremented when the row was originally claimed).
 
-### Per-video transcript: `transcripts/{video_id}.txt`
+### On-disk layout (sharded)
+
+All per-video artifacts live in shard subdirectories of `{transcripts}/`. The shard is the **last two characters of `video_id`** — e.g., `7234567890123456789` → shard `89`. Snowflake IDs encode time in their high bits; the low digits are essentially random, so 100 shards distribute evenly. At ~1M unique videos × 3–5 files each, each shard holds ~10–50k files — well within ext4's comfortable range.
+
+```
+{transcripts}/
+├── 00/                                       # one shard per "00".."99"
+│   ├── {video_id}.txt
+│   ├── {video_id}.json                       # transcript metadata
+│   ├── {video_id}.metadata.json              # video metadata (always)
+│   ├── {video_id}.metadata.raw.json          # raw payload (if keep_raw_metadata)
+│   ├── {video_id}.comments.json              # comments (if fetch_comments)
+│   └── {video_id}.<ext>.tmp                  # transient — cleaned up at startup
+├── 01/
+│   └── ...
+├── ...
+├── 99/
+│   └── ...
+└── .failed_audio/
+    └── {shard}/
+        └── {video_id}.wav                    # kept on any failure path; operator-driven cleanup
+```
+
+A `output::shard_path(video_id)` helper computes the shard and returns the full path. All output module callers go through it; no module hard-codes a path scheme.
+
+For dev with 5 videos, expect 1–5 occupied shards each holding one file. No code path differs between dev and prod.
+
+### Per-video transcript: `transcripts/{shard}/{video_id}.txt`
 
 Plain UTF-8, segments concatenated with newlines as whisper.cpp emits with `-of txt`. Trailing newline.
 
-### Per-video transcript metadata: `transcripts/{video_id}.json`
+### Per-video transcript metadata: `transcripts/{shard}/{video_id}.json`
 
 ```json
 {
@@ -540,7 +568,7 @@ Plain UTF-8, segments concatenated with newlines as whisper.cpp emits with `-of 
 }
 ```
 
-### Per-video video metadata: `transcripts/{video_id}.metadata.json`
+### Per-video video metadata: `transcripts/{shard}/{video_id}.metadata.json`
 
 Union schema across yt-dlp's `--write-info-json` and the API's `/research/video/query/` response, normalized to lowercase snake_case. Fields a source doesn't provide are `null`.
 
@@ -571,15 +599,13 @@ Union schema across yt-dlp's `--write-info-json` and the API's `/research/video/
 
   "api_voice_to_text": null,
   "effect_ids": null,
-  "playlist_id": null,
-
-  "raw_source_payload_path": "transcripts/7234567890123456789.metadata.raw.json"
+  "playlist_id": null
 }
 ```
 
-The full original payload (yt-dlp info JSON or API response) goes into the sibling `.metadata.raw.json` rather than embedded. Behind a `--keep-raw-metadata` flag, default on.
+The full original payload (yt-dlp info JSON or API response) goes into the sibling `{video_id}.metadata.raw.json` in the same shard directory rather than embedded — convention is implicit, no path field needed in `metadata.json`. Controlled by the `keep_raw_metadata` config (defaults on in dev, off in prod; ~100 KB × 1M videos = 100 GB at prod scale).
 
-### Per-video comments: `transcripts/{video_id}.comments.json` (only when `--fetch-comments`)
+### Per-video comments: `transcripts/{shard}/{video_id}.comments.json` (only when `--fetch-comments`)
 
 ```json
 {
@@ -745,12 +771,14 @@ Emits a progress line every 30s; per-video INFO log lines for stage transitions.
 ```
 (no args)                       Counts by status; counts of pending_resolutions
 --video-id <ID>                 Full event history for one video
---respondent-id <ID>            Per-respondent summary
+--respondent-id <ID>            Per-respondent summary (see fields below)
 --errors                        List failed_terminal videos with terminal_reason / terminal_message
 --retryable                     List failed_retryable videos with last_retryable_kind / last_retryable_message
 --unresolved                    List pending_resolutions rows with last_error
 --json                          Output as JSON
 ```
+
+`--respondent-id` summary fields: `videos_seen` (distinct video_ids in this respondent's watch_history), `videos_in_window` (subset where `in_window = 1`), `videos_succeeded`, `videos_failed_terminal`, `videos_failed_retryable`, `videos_pending`, `unresolved_short_links` (rows still in `pending_resolutions` for this respondent). Counts only; itemized lists via `status --video-id` per row.
 
 ### `requeue-retryables`
 
@@ -759,7 +787,8 @@ Operator command; flips selected `failed_retryable` rows back to `pending`. Reta
 ```
 --older-than <DURATION>         Only requeue if videos.updated_at older than this
 --error-kinds <KIND,KIND,...>   Only requeue rows whose last_retryable_kind matches
---max <N>                       Cap the number requeued
+--max-attempts <N>              Skip rows whose attempt_count is >= N (operator-side budget cap)
+--max <N>                       Cap the number requeued in this call
 --dry-run
 ```
 
@@ -778,8 +807,10 @@ Read-only derivation of Parquet manifest from SQLite + transcripts directory. Al
 
 ```
 --out <PATH>                    REQUIRED
---respondent-filter <PATH>      Optional CSV of respondent_ids to include
+--respondent-filter <PATH>      Optional CSV (header row required: respondent_id) of respondent_ids to include
 ```
+
+`--respondent-filter` file format: standard CSV with a header row containing at least the column `respondent_id`; other columns are tolerated and ignored. One ID per row. Empty rows skipped. This shape (rather than newline-delimited bare IDs or comma-separated CLI string) lets researchers reuse the same respondent list files they already use for survey-side analysis.
 
 ### Exit codes
 
@@ -926,13 +957,16 @@ Behavior: log at ERROR with full context, set abort flag, worker exits with `Err
 
 Per-video commit sequence — invariant: **never mark `succeeded` before durable artifact visibility.**
 
-All `.tmp` files live under `{transcripts}/.tmp/{video_id}/` — same filesystem as the final destinations, so `rename(2)` is atomic. Final artifacts land at the per-video paths in `{transcripts}/` (see Schemas). At `process` startup, any leftover `{transcripts}/.tmp/*` directories from prior crashes are deleted before claiming work — they're never the canonical artifact (which only exists post-rename), so removing them is safe.
+All `.tmp` files are sibling-suffix files inside the same shard directory as their final destinations (e.g., `transcripts/89/{video_id}.txt.tmp` → `transcripts/89/{video_id}.txt`). Same filesystem, same directory — `rename(2)` is atomic and the move never crosses directory boundaries. The shard directory is created on demand (`mkdir -p` semantics).
 
-1. Write `{transcripts}/.tmp/{video_id}/{video_id}.txt.tmp`, `.json.tmp`, `.metadata.json.tmp` (and `.metadata.raw.json.tmp`, `.comments.json.tmp` when applicable)
-2. `fsync` each temp file
-3. `rename` each to its final destination under `{transcripts}/`
-4. `fsync` the parent directory
-5. `Store::mark_succeeded` (videos UPDATE + video_events INSERT in one transaction)
+1. Compute `shard = output::shard_path(video_id)`; ensure `transcripts/{shard}/` exists.
+2. Write `transcripts/{shard}/{video_id}.txt.tmp`, `.json.tmp`, `.metadata.json.tmp` (plus `.metadata.raw.json.tmp` and `.comments.json.tmp` when applicable).
+3. `fsync` each temp file.
+4. `rename` each to its final name in the same directory.
+5. `fsync` the shard directory.
+6. `Store::mark_succeeded` (videos UPDATE + video_events INSERT in one transaction).
+
+At `process` startup, leftover `*.tmp` files from prior crashes are deleted across all shards before claiming work. They are never the canonical artifact (which only exists post-rename), so removing them is safe.
 
 Failure modes:
 - Artifact files exist but row is `in_progress` → next run treats as stale claim, re-fetches, idempotent overwrite.
@@ -940,7 +974,7 @@ Failure modes:
 
 ### Audio retention
 
-Audio files (`.wav`, intermediate `.m4a` if produced separately by yt-dlp) are deleted from `.tmp/` after a successful `mark_succeeded`. On any failure path (terminal, retryable, or Bug-class crash), the audio file is moved to `{transcripts}/.failed_audio/{video_id}.wav` for diagnosis. Cleanup of `.failed_audio/` is operator-driven — no automatic reaping. Operator sweeps the directory manually when the diagnostic data is no longer useful, or via a cron job tuned to whatever retention they prefer.
+Audio files (`.wav`, intermediate `.m4a` if produced separately by yt-dlp) live in `transcripts/{shard}/{video_id}.wav.tmp` during transcription and are deleted after a successful `mark_succeeded`. On any failure path (terminal, retryable, or Bug-class crash), the audio file is moved to `transcripts/.failed_audio/{shard}/{video_id}.wav` for diagnosis (sharded for the same reason as finals). Cleanup of `.failed_audio/` is operator-driven — no automatic reaping. Operator sweeps the directory manually when the diagnostic data is no longer useful, or via a cron job tuned to whatever retention they prefer.
 
 ### Stale-claim recovery
 
@@ -987,8 +1021,18 @@ Use a **real on-disk SQLite** in `tempfile::TempDir` (with WAL mode) for any tes
 | Stale claim sweep | Manually insert `in_progress` row with old `claimed_at`; sweep; verify `pending` and `attempt_count` **unchanged** |
 | Bug shutdown — orchestration level | `FakeFetcher` scripted Bug; verify abort flag set, no further claims/commits, JoinSet unwinds |
 | Bug shutdown — exit code | CLI smoke test verifying `process` exits with code 1 when a bug is triggered |
-| Artifact-write contract | Single video; verify `.txt`, `.json`, `.metadata.json` all exist at final paths, no `.tmp` left, then `mark_succeeded` row matches |
+| Artifact-write contract | Single video; verify `.txt`, `.json`, `.metadata.json` all exist at final sharded paths, no `.tmp` left, then `mark_succeeded` row matches |
 | `process` claims only pending | Confirms manual-batch eligibility rule explicitly |
+| Short-link resolution promotes correctly | Insert `pending_resolutions` rows for one short URL across N respondents; run resolver with a fake redirect-follower; verify one `videos` row + N `watch_history` rows + zero remaining `pending_resolutions` rows. `in_window` carried through. |
+| Short-link resolution failure path | Insert `pending_resolutions`; resolver fails; verify row stays with `last_error` populated; `videos` and `watch_history` unchanged |
+| `claim_next` ordering uses `(first_seen_at, video_id)` | Insert pending rows with controlled `first_seen_at`; verify claim order |
+| Partial index actually exists and is used | Test asserts `EXPLAIN QUERY PLAN` references `idx_videos_pending` |
+| Failure persistence: retryable vs terminal | After `mark_retryable_failure`, verify `last_retryable_kind` populated and `terminal_reason` NULL; after `mark_terminal_failure`, the inverse |
+| `recompute-window` updates `in_window` correctly | Insert `watch_history` and `pending_resolutions` rows with various `watched_at`; run with new window; verify flags on both tables |
+| `recompute-window` refuses without flags | No `--window-start`, no `--window-end`, no `--clear` → exit code 2 with usage error |
+| `Acquisition::Successful` carries metadata through to artifacts | Pipeline test: scripted `Successful` outcome with non-trivial metadata; verify `transcripts/{shard}/{id}.metadata.json` contains the expected fields |
+| `output::shard_path` distributes evenly | Hash 100k synthetic 19-digit IDs through `shard_path`; verify each of 100 shards receives 800–1200 (within ±20% of mean). Catches a regression that uses high digits instead of low. |
+| `requeue-retryables --max-attempts N` skips over-attempted rows | Two retryable rows, one with `attempt_count = 5`, one with `attempt_count = 2`; `--max-attempts 3` requeues only the second |
 
 `FakeFetcher` shape:
 
@@ -1011,18 +1055,6 @@ enum FakeOutcome {
 ```
 
 Each test owns its temp dir of pre-staged WAV fixtures (when needed for `AudioFile` outcomes).
-
-### Tier 2 — additional tests for the new fixes
-
-| What | Notes |
-|------|-------|
-| Short-link resolution promotes correctly | Insert `pending_resolutions` rows for one short URL across N respondents; run resolver with a fake redirect-follower; verify one `videos` row + N `watch_history` rows + zero remaining `pending_resolutions` rows |
-| Short-link resolution failure path | Insert `pending_resolutions`; resolver fails; verify row stays with `last_error` populated; `videos` and `watch_history` unchanged |
-| `claim_next` ordering uses `(first_seen_at, video_id)` | Insert pending rows with controlled `first_seen_at`; verify claim order |
-| Partial index actually exists and is used | Test asserts `EXPLAIN QUERY PLAN` references `idx_videos_pending` |
-| Failure persistence: retryable vs terminal | After `mark_retryable_failure`, verify `last_retryable_kind` populated and `terminal_reason` NULL; after `mark_terminal_failure`, the inverse |
-| `recompute-window` updates `in_window` correctly | Insert watch_history rows with various `watched_at`; run with new window; verify flags |
-| `Acquisition::Successful` carries metadata through to artifacts | Pipeline test: scripted `Successful` outcome with non-trivial metadata; verify `transcripts/{id}.metadata.json` contains the expected fields |
 
 ### Tier 3 — Smoke tests against real tools (`#[ignore]`, run via `cargo test -- --ignored`, slow)
 
@@ -1093,10 +1125,12 @@ Nightly Rust added later if a real reason emerges.
 | No `ApiFetcher` stub in v1 | Stub would rot; trait + enum are sufficient to land the implementation later without restructuring. |
 | `video_id` as TEXT throughout | Avoids JSON precision-loss bugs at boundaries; yt-dlp and API both serialize as strings. |
 | Multi-GPU = two binary instances, shared SQLite | Simpler than per-binary GPU pool; SQLite atomic claims serialize work-acquisition correctly. |
+| Sharded transcripts directory (`{transcripts}/{video_id[-2:]}/`) | Flat directory holds 5M+ files at prod scale; ext4 handles it but tooling chokes (`ls`, `readdir`). Sharding by Snowflake ID's low digits gives ~uniform 100-bucket distribution. Single `shard_path()` helper; no other code is path-aware. |
+| Sibling-suffix tmp files in the same shard dir (not a separate `.tmp/` tree) | More idiomatic; `rename(2)` stays in-directory; cleanup at startup is a single glob across shards. |
 | `pending_resolutions` stores `in_window` at enqueue time (mirrors `watch_history`) | Avoids "resolved short links silently get the wrong window flag because window flags weren't supplied at resolve time." `recompute-window` updates both tables together. |
 | `recompute-window` requires explicit window flags or `--clear` | Default-no-args would silently wipe filtering for the entire study — too easy a mistake. Force a deliberate choice. |
 | Audio kept on failure, deleted on success; cleanup is operator-driven | Pipeline knows nothing about retention policy (manual, cron, never); operator handles `.failed_audio/` directly. |
-| Tmp files under `{transcripts}/.tmp/{video_id}/` (same FS as finals) | Guarantees `rename(2)` atomicity for the commit contract. Startup deletes leftover `.tmp/` from prior crashes. |
+| Sibling-suffix `.tmp` files in same shard directory as finals | Guarantees `rename(2)` atomicity (in-directory) for the commit contract. Startup deletes leftover `*.tmp` across all shards. |
 | `keep_raw_metadata` defaults false in prod | ~100 KB × 1M videos = 100 GB of raw payloads otherwise. Keep available for forensics in dev; opt-in only at prod scale. |
 | `--include-failed` removed from `export-manifest`; manifest always includes all rows | The researcher can filter on `status` post-hoc; removing the flag eliminates a confusing default-true boolean. |
 | Pipeline reads donation-extractor JSON (not raw DDP) | Donation-side script is the natural format owner; this pipeline consumes its output. Format documented under "DDP-extracted JSON input format". |
