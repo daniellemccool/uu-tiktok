@@ -23,3 +23,15 @@ decisions:
             - author: Danielle McCool
               date: "2026-04-16 21:59:07"
               comment: "1"
+    "0003":
+        adr_id: "0003"
+        title: Test discipline for plan-prescribed code and deviations
+        status: decided
+        tags: []
+        links:
+            precedes: []
+            succeeds: []
+        comments:
+            - author: Danielle McCool
+              date: "2026-04-16 22:27:00"
+              comment: "1"
