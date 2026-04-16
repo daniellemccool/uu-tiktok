@@ -5,6 +5,7 @@ mod canonical;
 mod cli;
 mod config;
 mod errors;
+mod fetcher;
 mod output;
 mod process;
 mod state;
