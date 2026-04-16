@@ -27,3 +27,8 @@ manifest.parquet
 
 # Other tool session state
 .codex
+
+
+# Added by cargo
+
+/target
