@@ -43,3 +43,89 @@ If DDP exports turn out to commonly include `?utm_source=…` on shared short
 links, consider promoting this to a fixed bug in Plan B's first iteration
 rather than waiting for Plan C — depends on what the donation extraction
 script actually emits.
+
+---
+
+## `process::run` buffers full stderr/stdout in memory before truncation
+
+**Found in:** T6 code quality review (opus).
+**Disposition:** Deferred to Plan B (concurrent fetches make it matter).
+**Trigger to revisit:** Plan B's fetch-orchestrator design.
+
+`src/process.rs` reads the entire stdout AND stderr streams into `Vec<u8>` via
+`read_to_end` before `ring_buffer_tail` slices the tail down to
+`stderr_capture_bytes`. The `cap` only bounds the *retained excerpt* in the
+returned `CommandOutcome`; it does not bound peak memory.
+
+For Plan A's curated tools (yt-dlp/ffmpeg/whisper.cpp on a single video) this
+never matters in practice. For Plan B's many-concurrent-fetches scenario, a
+misbehaving tool that emits 10GB to stderr would allocate 10GB in this process
+before truncation.
+
+**Suggested fix (Plan B):** replace `read_to_end` with a streaming reader that
+maintains a rolling `VecDeque<u8>` of size `cap`, dropping bytes beyond `cap`
+during accumulation. Optionally cap stdout too with a separate
+`stdout_capture_bytes` (yt-dlp writes audio to a file so its stdout is small,
+but defense-in-depth).
+
+The doc comment on `stderr_capture_bytes` was updated in T6 fixup to honestly
+describe the current behavior.
+
+---
+
+## `ring_buffer_tail` is misnamed (it's not a ring buffer)
+
+**Found in:** T6 code quality review (opus).
+**Disposition:** Bundle with the bounded-buffering fix above.
+**Trigger to revisit:** Plan B's bounded-buffering work.
+
+The function name `ring_buffer_tail` suggests ring-buffer semantics, but the
+implementation is a tail-of-slice helper. A clearer name (`tail_excerpt` or
+`last_n_bytes_lossy`) would set the right expectations. Defer the rename to
+when the bounded-buffering fix lands so we touch this code only once.
+
+---
+
+## `From<RunError> for FetchError` collapses Spawn and Io into NetworkError
+
+**Found in:** T6 code quality review (opus).
+**Disposition:** Deferred to Plan B (failure classification work).
+**Trigger to revisit:** Plan B introduces `RetryableKind` /
+`UnavailableReason` / `ClassifiedFailure`.
+
+The current mapping in `src/process.rs`:
+
+- `RunError::Spawn` → `FetchError::NetworkError` (binary missing or fork
+  failure — environmental/configuration, terminal)
+- `RunError::Io` → `FetchError::NetworkError` (pipe read failure — system,
+  potentially transient)
+- `RunError::Timeout` → `FetchError::ToolTimeout` (correct as-is)
+
+Both Spawn and Io being labeled "NetworkError" will misguide Plan B's
+retry/backoff logic: a missing binary should not be retried with network
+backoff (the binary will still be missing). Plan B should split these into
+dedicated variants (e.g., `FetchError::ToolNotFound`, `FetchError::ConfigError`,
+`FetchError::SystemIo`) and classify them appropriately.
+
+A one-line note above the `From` impl in `src/process.rs` points here.
+
+---
+
+## `status.code().unwrap_or(-1)` loses signal information
+
+**Found in:** T6 code quality review (opus).
+**Disposition:** Deferred to Plan B (failure classification work).
+**Trigger to revisit:** Plan B's classification needs to distinguish OOM-kill
+(SIGKILL by oom-killer), user cancel (SIGINT), and crash (SIGSEGV).
+
+When a child is killed by a signal, `status.code()` returns `None`, and the
+current code collapses that to the sentinel `-1`. Recovering the signal number
+requires `std::os::unix::process::ExitStatusExt::signal()`.
+
+For Plan A this is fine: in-scope timeouts go through the `Timeout` arm before
+`code()` is read; out-of-scope kills are rare.
+
+For Plan B's failure classification, distinguishing OOM-kill from
+user-cancelled from segfault matters for retry decisions. Plan B should expand
+`CommandOutcome` with a `signal: Option<i32>` field (Unix-only via cfg), or
+introduce a richer `CompletionStatus` enum.

@@ -15,7 +15,12 @@ pub struct CommandSpec<'a> {
     pub program: &'static str,
     pub args: Vec<String>,
     pub timeout: Duration,
-    /// Last-N bytes of stderr to retain. Avoids OOM on chatty tools.
+    /// Last-N bytes of stderr to retain in `CommandOutcome.stderr_excerpt`.
+    /// Does NOT bound peak memory: the full stderr stream is buffered in
+    /// memory before truncation. Acceptable for Plan A's curated tools
+    /// (yt-dlp, ffmpeg, whisper.cpp on a single video). See
+    /// `docs/FOLLOWUPS.md` for the bounded-buffering improvement Plan B
+    /// should make if many fetches run concurrently.
     pub stderr_capture_bytes: usize,
     /// Argument indices to redact in the structured log (e.g., cookie file paths).
     pub redact_arg_indices: &'a [usize],
@@ -55,6 +60,11 @@ pub enum RunError {
 }
 
 // Dead code allowed: consumed by T11 (YtDlpFetcher) and T12 (transcribe step).
+//
+// Plan A coarse mapping: Spawn (environmental, e.g. binary missing) and Io
+// (system pipe error) both map to NetworkError, which is semantically wrong.
+// Plan B's failure classification (RetryableKind / UnavailableReason) will
+// need to revisit this — see docs/FOLLOWUPS.md.
 #[allow(dead_code)]
 impl From<RunError> for FetchError {
     fn from(err: RunError) -> Self {
@@ -143,8 +153,13 @@ pub async fn run(spec: CommandSpec<'_>) -> Result<CommandOutcome, RunError> {
         }
         Ok(Err(e)) => Err(e),
         Err(_elapsed) => {
-            // Timed out: kill_on_drop will SIGKILL the child when `child` is dropped.
-            // Drop here happens at the end of this async block.
+            // Timed out. Defense-in-depth termination:
+            //   1. Explicit `start_kill()` sends SIGKILL immediately.
+            //   2. `kill_on_drop(true)` (set on spawn) sends SIGKILL again on
+            //      drop as a backstop if a future refactor changes this control
+            //      flow (e.g., moves `child` out of scope earlier).
+            // The second SIGKILL is a no-op on an already-exiting process.
+            // Both mechanisms intentional — do not "clean up" by removing one.
             let _ = child.start_kill();
             Err(RunError::Timeout {
                 tool: spec.program,
