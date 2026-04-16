@@ -271,3 +271,103 @@ high-digits implementation would collapse to 1-2 buckets). The bounds check
 is decorative for this input; either tighten it (e.g., assert exact equality
 to 100) or replace the input with a PRNG-driven sample to exercise the
 bound meaningfully.
+
+---
+
+## `videos.updated_at` is frozen at first-seen by `upsert_video`
+
+**Found in:** T9 code quality review (opus).
+**Disposition:** Accepted for T9; re-evaluate as T10/T13 land.
+**Trigger to revisit:** T10 (`claim_next` / `mark_succeeded`), T13 (ingest cmd),
+or any future Store mutator that touches a `videos` row.
+
+`Store::upsert_video` uses `INSERT OR IGNORE` and binds the same `now` value to
+both `first_seen_at` and `updated_at`. On a re-upsert, neither column is
+written. The brief's idempotence test only asserts `first_seen_at` is
+unchanged, but `updated_at` is equally frozen — which contradicts the natural
+reading of the column name ("when was this row last touched").
+
+For pure-ingest semantics this is correct: nothing about the row changed. But
+T10's `claim_next` / `mark_succeeded` and any later mutators MUST remember to
+bump `updated_at` themselves, since `upsert_video` will not update it on
+subsequent calls. If they forget, `updated_at` becomes a misnomer.
+
+Two reasonable resolutions when this surfaces:
+
+- Accept the contract: rename to `inserted_at` (or document `updated_at` as
+  "last write to mutable columns, not including idempotent re-upsert").
+- Switch `upsert_video` to `INSERT ... ON CONFLICT(video_id) DO UPDATE SET
+  updated_at = excluded.updated_at` — preserves `first_seen_at` and
+  `source_url` invariants while bumping `updated_at` on every observation.
+  Add a regression test asserting `updated_at` strictly increases on
+  re-upsert and `first_seen_at` does not.
+
+The choice depends on whether `updated_at` is meant as "last-mutation marker"
+(useful for stale-claim detection in Plan B) or "last meaningful state
+change". Plan B's stale-claim recovery is the most likely first consumer that
+will care.
+
+---
+
+## `Store::conn` / `Store::conn_mut` dead-code justifications are stale
+
+**Found in:** T9 code quality review (opus).
+**Disposition:** Defer to T10; flag if T10 also bypasses the accessors.
+**Trigger to revisit:** T10 (`claim_next` / `mark_succeeded`) implementation
+review.
+
+`src/state/mod.rs` lines 105 and 111 carry `#[allow(dead_code)]` with the
+comment "T9 (store-ingest) and T10 (store-claims) are the first consumers."
+T9 reached the connection via direct private-field access (`self.conn`)
+rather than calling `conn()` / `conn_mut()`, so neither accessor was
+consumed. The comment is now factually wrong.
+
+If T10 also goes via `self.conn`, the comment should be revised (or the
+accessors removed entirely if no one ever uses them). If T10 is intended to
+go through the accessor — for instance, because a transaction needs `&mut
+Connection` returned to a helper that owns no `Store` — then the comment
+becomes accurate again on T10 landing.
+
+Resolution options:
+
+- Lowest-cost: T10 reviewer checks whether the accessors are now consumed and
+  either removes `#[allow(dead_code)]` (if so) or updates the comment to
+  name a later task / drops the accessors entirely.
+- Structural: defer to AD0002's bin/lib reassessment, where `pub(crate)`
+  accessors may go away anyway under Option 4 (thin-binary fat-library).
+
+Per AD0002's cleanup discipline — periodic backstop is `rg "allow\(dead_code\)" src/`.
+
+---
+
+## Cargo `test-helpers` feature pattern is undocumented
+
+**Found in:** T9 code quality review (opus).
+**Disposition:** Worth promoting to an ADR before T10/T11/T12 add more
+cfg-gated library items.
+**Trigger to revisit:** before T10 (claim helpers will likely want the same
+treatment), or at the Plan A / Plan B reassessment point.
+
+T9 introduced the first Cargo feature flag in the crate
+(`test-helpers = []`) and the per-test `required-features = ["test-helpers"]`
+attribute. The pattern works correctly and matches Rust idiom for "library
+item visible to integration tests but not to library consumers." But:
+
+- The choice is undocumented in any ADR. Alternatives considered (sub-crate;
+  `pub(crate)` + `#[cfg(test)]` re-export module; in-crate unit tests only)
+  were ruled out implicitly via the brief, not on record.
+- The pattern interacts with AD0002: `cargo clippy --all-targets
+  --features test-helpers` enables the feature in the bin compilation too,
+  which is why the new `#[allow(dead_code)]` is needed on `VideoRow` and
+  `get_video_for_test`. The justification comments capture this in code,
+  but the policy is not in any ADR.
+- T10, T11, T12 will likely add more cfg-gated test helpers (row inspectors
+  after `claim_next`, fake fetcher impls). An ADR locking the convention
+  now would prevent ad-hoc divergence.
+
+Suggested ADR scope: when to add a `test-helpers`-gated item vs. an
+in-crate-only `#[cfg(test)]` item; whether such items are `pub` or
+`pub(crate)`; how their dead-code suppression interacts with AD0002;
+whether `Cargo.toml` should keep adding `[[test]] required-features`
+blocks per integration-test file or accept that all integration tests
+require the feature.
