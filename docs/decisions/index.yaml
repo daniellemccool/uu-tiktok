@@ -1,0 +1,25 @@
+decisions:
+    "0001":
+        adr_id: "0001"
+        title: Split Plan A into per-task files for cheaper subagent context
+        status: decided
+        tags: []
+        links:
+            precedes: []
+            succeeds: []
+        comments:
+            - author: Danielle McCool
+              date: "2026-04-16 21:57:55"
+              comment: "1"
+    "0002":
+        adr_id: "0002"
+        title: Dead-code suppression strategy and deferred binary-library restructuring
+        status: decided
+        tags: []
+        links:
+            precedes: []
+            succeeds: []
+        comments:
+            - author: Danielle McCool
+              date: "2026-04-16 21:59:07"
+              comment: "1"
