@@ -309,32 +309,165 @@ will care.
 
 ---
 
-## `Store::conn` / `Store::conn_mut` dead-code justifications are stale
+## `Store::conn` / `Store::conn_mut` accessor hygiene after T10
 
-**Found in:** T9 code quality review (opus).
-**Disposition:** Defer to T10; flag if T10 also bypasses the accessors.
-**Trigger to revisit:** T10 (`claim_next` / `mark_succeeded`) implementation
-review.
+**Found in:** T9 code quality review, re-confirmed in T10 review (opus).
+**Disposition:** Cleanup commit, or fold into AD0002's bin/lib
+reassessment.
+**Trigger to revisit:** Plan A reassessment point, or any task that
+genuinely needs `&Connection` / `&mut Connection` outside `Store`'s
+own `impl`.
 
-`src/state/mod.rs` lines 105 and 111 carry `#[allow(dead_code)]` with the
-comment "T9 (store-ingest) and T10 (store-claims) are the first consumers."
-T9 reached the connection via direct private-field access (`self.conn`)
-rather than calling `conn()` / `conn_mut()`, so neither accessor was
-consumed. The comment is now factually wrong.
+`src/state/mod.rs` lines 105 and 111 carry `#[allow(dead_code)]` with
+comments naming T9 and T10 as the first consumers. Both tasks have now
+landed and both went via direct `self.conn` field access. The comments
+are factually wrong.
 
-If T10 also goes via `self.conn`, the comment should be revised (or the
-accessors removed entirely if no one ever uses them). If T10 is intended to
-go through the accessor — for instance, because a transaction needs `&mut
-Connection` returned to a helper that owns no `Store` — then the comment
-becomes accurate again on T10 landing.
+Current state of consumers:
+- `Store::conn` — used only by the `#[cfg(test)]` NULL-rejection
+  unit tests at `src/state/mod.rs::tests::null_video_id_rejected_*` and
+  `null_meta_key_rejected_*`. So it has one real consumer, gated to
+  test compilation.
+- `Store::conn_mut` — no consumer at all.
 
 Resolution options:
 
-- Lowest-cost: T10 reviewer checks whether the accessors are now consumed and
-  either removes `#[allow(dead_code)]` (if so) or updates the comment to
-  name a later task / drops the accessors entirely.
-- Structural: defer to AD0002's bin/lib reassessment, where `pub(crate)`
-  accessors may go away anyway under Option 4 (thin-binary fat-library).
+- Lowest-cost: delete `conn_mut` outright; rewrite the `conn()` comment
+  to say "used by cfg(test) schema invariant tests; keep until lib API
+  stabilizes."
+- Structural: defer to AD0002's reassessment — under Option 4
+  (thin-binary fat-library) the `pub(crate)` accessors may go away
+  entirely.
 
-Per AD0002's cleanup discipline — periodic backstop is `rg "allow\(dead_code\)" src/`.
+Per AD0002's cleanup discipline, the `rg "allow\(dead_code\)" src/`
+audit catches this on every pass.
+
+---
+
+## `concurrent_claim_serializes_via_begin_immediate` doesn't actually race
+
+**Found in:** T10 code quality review (opus).
+**Disposition:** Test-quality gap; defer until Plan B introduces real
+concurrency (multi-instance / async pipeline).
+**Trigger to revisit:** Plan B's first multi-worker design, or any change
+to the `claim_next` transaction shape.
+
+`tests/state_claims.rs::concurrent_claim_serializes_via_begin_immediate`
+creates two `Store` handles to one DB file but invokes `claim_next` on
+them sequentially on the main thread. The first call commits before the
+second begins, so the second naturally finds no pending row. The
+`BEGIN IMMEDIATE` write-lock path, `busy_timeout = 5000`, and the WAL
+writer-exclusion contract are never exercised — a regression that
+downgraded the transaction to `BEGIN DEFERRED` or removed it entirely
+would still pass this test.
+
+**Suggested fix:** rewrite using `std::thread::spawn` + `std::sync::Barrier`
+so both threads enter `claim_next` simultaneously, then assert exactly
+one returns `Some` and the other returns `Ok(None)` (or, with one row,
+that the loser observes the row already `in_progress`). For two-worker
+contention with multiple pending rows, assert each worker claims a
+distinct `video_id`. Out-of-scope for Plan A's serial loop; Plan B's
+multi-worker design will need this anyway.
+
+---
+
+## `mark_succeeded` doesn't require `status = 'in_progress'`
+
+**Found in:** T10 code quality review (opus).
+**Disposition:** Defensive-programming gap; defer to Plan B (state
+machine + recovery).
+**Trigger to revisit:** Plan B's stale-claim recovery / retry design, or
+any task that grows additional state-transition mutators.
+
+`Store::mark_succeeded` does an unconditional UPDATE — no `WHERE
+status = 'in_progress'` predicate. A caller that invokes it on a
+`pending`, already-`succeeded`, or `failed_*` row silently transitions
+the row to `succeeded`. For Plan A's strictly-serial loop (claim → fetch
+→ transcribe → succeed within one synchronous call) this cannot happen,
+so it's accepted for now.
+
+For Plan B this becomes a real concern: stale-claim recovery, retry
+flows, and any out-of-order mutator could land here. Either:
+- Add a `WHERE status = 'in_progress' AND claimed_by = ?` predicate and
+  return an error (or `bool`) when 0 rows update; or
+- Introduce a typed state-machine layer above `Store` that gates
+  transitions before SQL emission.
+
+The same observation applies to the future `mark_failed_terminal` /
+`mark_failed_retryable` mutators that Plan B will add — bake the gate
+into the convention before they're written.
+
+---
+
+## `claim_next` / `mark_succeeded` inner statements lack `with_context`
+
+**Found in:** T10 code quality review (opus).
+**Disposition:** Cosmetic; bundle with the next real edit to these
+functions.
+**Trigger to revisit:** Plan B (failure classification will likely
+restructure error mapping anyway), or whenever a real bug surfaces
+without enough context to diagnose.
+
+`Store::claim_next` wraps the `transaction_with_behavior` and `commit`
+with `.context(...)` but its inner `tx.execute(...)` calls (UPDATE
+videos and INSERT video_events) bare-`?` raw `rusqlite::Error`. Same in
+`Store::mark_succeeded` for the INSERT video_events statement (the
+videos UPDATE is correctly contextualized via `with_context`).
+
+A FK violation or other constraint failure on those statements surfaces
+without `worker_id` / `video_id` context. Operationally fine for Plan
+A's single-row happy path; worth tightening when failure classification
+lands in Plan B.
+
+---
+
+## Plan B reassessment: `claim_next` polling semantics
+
+**Found in:** T10 code quality review (opus).
+**Disposition:** Defer to Plan B's process-loop / multi-instance design.
+**Trigger to revisit:** Plan B planning session.
+
+Two related concerns about how `Store::claim_next` will behave under
+Plan B's concurrent / multi-instance workloads, neither relevant to
+Plan A's serial single-process loop:
+
+1. **Empty-DB path commits an empty IMMEDIATE transaction.** When no
+   pending row exists, `claim_next` calls `tx.commit()?` before
+   returning `Ok(None)`. Functionally correct — committing an empty
+   transaction releases the RESERVED lock the same as rollback would —
+   but a hot polling loop that finds nothing on every tick churns the
+   write lock. `drop(tx)` would be marginally cheaper and clearer
+   about "we did nothing." Plan B should decide whether the polling
+   loop short-polls (then the change matters) or sleeps between polls
+   (then it doesn't).
+
+2. **`BEGIN IMMEDIATE` + `busy_timeout = 5000` blocking semantics.**
+   A worker that finds another worker mid-claim will block up to 5
+   seconds inside `transaction_with_behavior` waiting for the lock.
+   For Plan A (one worker) this never fires. For Plan B's
+   multi-worker design, the choice between "block up to N seconds"
+   and "fail fast and back off" is a design decision that should be
+   explicit, not inherited from the per-connection PRAGMA.
+
+Both concerns out of scope for T10 — flag for the Plan A → Plan B
+reassessment point.
+
+---
+
+## Missing round-trip test: succeeded videos must not be re-claimable
+
+**Found in:** T10 code quality review (opus).
+**Disposition:** Coverage gap; defer until next edit to state_claims.rs
+or T14 (process serial loop) lands a higher-level e2e fake-fetcher test.
+**Trigger to revisit:** T14 implementation, or any change to
+`claim_next`'s status filter.
+
+`tests/state_claims.rs` exercises each transition independently
+(`claim_next` of a pending row, `mark_succeeded` of an in_progress row)
+but never composes `claim_next` → `mark_succeeded` → `claim_next` and
+asserts the second claim returns `Ok(None)`. A regression that, say,
+changed the SELECT predicate to `WHERE status IN ('pending',
+'succeeded')` would not be caught by the current suite. T14's
+end-to-end fake-fetcher tests will likely cover this incidentally;
+if they don't, add a one-liner here.
 
