@@ -7,6 +7,34 @@ use rusqlite::{params, Connection};
 
 pub use schema::SCHEMA_VERSION;
 
+// Helper for upsert_video / upsert_watch_history. Bin compilation re-includes
+// state via `mod state;` (per AD0002) and has no caller until T13 (ingest cmd).
+#[allow(dead_code)]
+fn unix_now() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Test-only helper for verifying row state. Not part of the public API; gated
+/// to test compilation only.
+// Cfg-gated to `any(test, feature = "test-helpers")`. When clippy/clippy-style
+// tests run with `--features test-helpers`, the bin compilation also gets the
+// feature and includes this struct, but never references it — hence dead_code.
+#[cfg(any(test, feature = "test-helpers"))]
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct VideoRow {
+    pub video_id: String,
+    pub status: String,
+    pub canonical: bool,
+    pub source_url: String,
+    pub first_seen_at: i64,
+    pub attempt_count: i64,
+}
+
 pub struct Store {
     conn: Connection,
 }
@@ -84,6 +112,84 @@ impl Store {
     #[allow(dead_code)]
     pub(crate) fn conn_mut(&mut self) -> &mut Connection {
         &mut self.conn
+    }
+
+    // T13 (ingest cmd) is the first bin consumer; integration tests at
+    // tests/state_ingest.rs already exercise this in the lib compilation.
+    #[allow(dead_code)]
+    pub fn upsert_video(
+        &mut self,
+        video_id: &str,
+        source_url: &str,
+        canonical: bool,
+    ) -> Result<()> {
+        let now = unix_now();
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO videos
+                 (video_id, source_url, canonical, status,
+                  first_seen_at, updated_at)
+                 VALUES (?1, ?2, ?3, 'pending', ?4, ?4)",
+                params![video_id, source_url, canonical as i64, now],
+            )
+            .with_context(|| format!("upserting video {}", video_id))?;
+        Ok(())
+    }
+
+    // T13 (ingest cmd) is the first bin consumer; integration tests at
+    // tests/state_ingest.rs already exercise this in the lib compilation.
+    #[allow(dead_code)]
+    pub fn upsert_watch_history(
+        &mut self,
+        respondent_id: &str,
+        video_id: &str,
+        watched_at: i64,
+        in_window: bool,
+    ) -> Result<usize> {
+        let changed = self
+            .conn
+            .execute(
+                "INSERT OR IGNORE INTO watch_history
+                 (respondent_id, video_id, watched_at, in_window)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![respondent_id, video_id, watched_at, in_window as i64],
+            )
+            .with_context(|| {
+                format!(
+                    "upserting watch_history (respondent={}, video={}, watched_at={})",
+                    respondent_id, video_id, watched_at
+                )
+            })?;
+        Ok(changed)
+    }
+}
+
+impl Store {
+    // Cfg-gated test helper; same bin-firing dynamic as `VideoRow` above when
+    // `--features test-helpers` is enabled at the workspace level.
+    #[cfg(any(test, feature = "test-helpers"))]
+    #[allow(dead_code)]
+    pub fn get_video_for_test(&self, video_id: &str) -> Result<Option<VideoRow>> {
+        use rusqlite::OptionalExtension;
+        let row = self
+            .conn
+            .query_row(
+                "SELECT video_id, status, canonical, source_url, first_seen_at, attempt_count
+                 FROM videos WHERE video_id = ?1",
+                params![video_id],
+                |r| {
+                    Ok(VideoRow {
+                        video_id: r.get(0)?,
+                        status: r.get(1)?,
+                        canonical: r.get::<_, i64>(2)? != 0,
+                        source_url: r.get(3)?,
+                        first_seen_at: r.get(4)?,
+                        attempt_count: r.get(5)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
     }
 }
 

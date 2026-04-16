@@ -22,3 +22,10 @@ once_cell = "1"
 tempfile = "3"
 assert_cmd = "2"
 predicates = "3"
+
+[features]
+test-helpers = []
+
+[[test]]
+name = "state_ingest"
+required-features = ["test-helpers"]
