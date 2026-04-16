@@ -29,3 +29,7 @@ test-helpers = []
 [[test]]
 name = "state_ingest"
 required-features = ["test-helpers"]
+
+[[test]]
+name = "state_claims"
+required-features = ["test-helpers"]

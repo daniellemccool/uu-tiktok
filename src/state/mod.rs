@@ -3,7 +3,7 @@ mod schema;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
 pub use schema::SCHEMA_VERSION;
 
@@ -164,13 +164,133 @@ impl Store {
     }
 }
 
+/// Represents a successfully claimed video row, returned by `claim_next`.
+// T14 (process serial loop) is the first bin consumer.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct Claim {
+    pub video_id: String,
+    pub source_url: String,
+    pub attempt_count: i64,
+}
+
+/// Artifacts written to the database upon successful transcription.
+// T14 (process serial loop) is the first bin consumer.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct SuccessArtifacts {
+    pub duration_s: Option<f64>,
+    pub language_detected: Option<String>,
+    pub fetcher: &'static str,
+    pub transcript_source: &'static str,
+}
+
+impl Store {
+    /// Atomically claim the oldest pending video for processing.
+    ///
+    /// Uses `BEGIN IMMEDIATE` to serialize concurrent claim attempts across
+    /// multiple connections to the same SQLite file.
+    // T14 (process serial loop) is the first bin consumer; integration tests at tests/state_claims.rs exercise this in the lib compilation.
+    #[allow(dead_code)]
+    pub fn claim_next(&mut self, worker_id: &str) -> Result<Option<Claim>> {
+        let now = unix_now();
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .context("begin immediate for claim_next")?;
+
+        let candidate: Option<(String, String, i64)> = tx
+            .query_row(
+                "SELECT video_id, source_url, attempt_count
+                 FROM videos
+                 WHERE status = 'pending'
+                 ORDER BY first_seen_at ASC, video_id ASC
+                 LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+
+        let Some((video_id, source_url, prev_attempts)) = candidate else {
+            tx.commit()?;
+            return Ok(None);
+        };
+
+        let new_attempts = prev_attempts + 1;
+        tx.execute(
+            "UPDATE videos
+             SET status = 'in_progress',
+                 claimed_by = ?2,
+                 claimed_at = ?3,
+                 attempt_count = ?4,
+                 updated_at = ?3
+             WHERE video_id = ?1",
+            params![video_id, worker_id, now, new_attempts],
+        )?;
+
+        tx.execute(
+            "INSERT INTO video_events (video_id, at, event_type, worker_id, detail_json)
+             VALUES (?1, ?2, 'claimed', ?3, NULL)",
+            params![video_id, now, worker_id],
+        )?;
+
+        tx.commit().context("commit claim transaction")?;
+
+        Ok(Some(Claim {
+            video_id,
+            source_url,
+            attempt_count: new_attempts,
+        }))
+    }
+
+    /// Mark a video as succeeded and record a `succeeded` event, atomically.
+    // T14 (process serial loop) is the first bin consumer; integration tests exercise this in the lib compilation.
+    #[allow(dead_code)]
+    pub fn mark_succeeded(&mut self, video_id: &str, artifacts: SuccessArtifacts) -> Result<()> {
+        let now = unix_now();
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .context("begin immediate for mark_succeeded")?;
+
+        tx.execute(
+            "UPDATE videos
+             SET status = 'succeeded',
+                 succeeded_at = ?2,
+                 duration_s = ?3,
+                 language_detected = ?4,
+                 fetcher = ?5,
+                 transcript_source = ?6,
+                 updated_at = ?2
+             WHERE video_id = ?1",
+            params![
+                video_id,
+                now,
+                artifacts.duration_s,
+                artifacts.language_detected,
+                artifacts.fetcher,
+                artifacts.transcript_source,
+            ],
+        )
+        .with_context(|| format!("update videos for succeeded {}", video_id))?;
+
+        tx.execute(
+            "INSERT INTO video_events (video_id, at, event_type, worker_id, detail_json)
+             VALUES (?1, ?2, 'succeeded', NULL, NULL)",
+            params![video_id, now],
+        )?;
+
+        tx.commit().context("commit mark_succeeded")?;
+        Ok(())
+    }
+}
+
 impl Store {
     // Cfg-gated test helper; same bin-firing dynamic as `VideoRow` above when
     // `--features test-helpers` is enabled at the workspace level.
     #[cfg(any(test, feature = "test-helpers"))]
     #[allow(dead_code)]
     pub fn get_video_for_test(&self, video_id: &str) -> Result<Option<VideoRow>> {
-        use rusqlite::OptionalExtension;
         let row = self
             .conn
             .query_row(
@@ -190,6 +310,37 @@ impl Store {
             )
             .optional()?;
         Ok(row)
+    }
+}
+
+/// A row from `video_events`, returned by `get_events_for_test`.
+// Cfg-gated test helper per AD0005; fires dead_code in bin compilation when --features test-helpers is enabled.
+#[cfg(any(test, feature = "test-helpers"))]
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct EventRow {
+    pub event_type: String,
+    pub worker_id: Option<String>,
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+impl Store {
+    /// Retrieve all `video_events` rows for a given video_id, ordered by id.
+    // Cfg-gated test helper per AD0005; same bin-firing dynamic as EventRow above.
+    #[allow(dead_code)]
+    pub fn get_events_for_test(&self, video_id: &str) -> Result<Vec<EventRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT event_type, worker_id FROM video_events WHERE video_id = ?1 ORDER BY id",
+        )?;
+        let rows: Vec<EventRow> = stmt
+            .query_map(params![video_id], |r| {
+                Ok(EventRow {
+                    event_type: r.get(0)?,
+                    worker_id: r.get(1)?,
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
     }
 }
 
