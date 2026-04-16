@@ -1,0 +1,26 @@
+# Node (crawler tool)
+node_modules/
+
+# Rust (future pipeline)
+target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# Pipeline runtime data — never commit these
+inbox/
+transcripts/
+state.sqlite
+state.sqlite-wal
+state.sqlite-shm
+manifest.parquet
+*.tmp
+
+# Editor / OS
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Claude session state
+.claude/projects/
