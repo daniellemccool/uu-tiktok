@@ -9,6 +9,7 @@ mod fetcher;
 mod output;
 mod process;
 mod state;
+mod transcribe;
 
 #[tokio::main]
 async fn main() -> Result<()> {
