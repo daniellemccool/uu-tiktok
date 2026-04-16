@@ -4,6 +4,8 @@ use std::time::Duration;
 use crate::cli::{GlobalArgs, Profile};
 
 #[derive(Debug, Clone)]
+// Plan A T3 only reads `profile` and `state_db` (logged in main); remaining fields are
+// populated for tasks T11/T13/T14/T15 to consume. Allow until first reader lands.
 #[allow(dead_code)]
 pub struct Config {
     pub profile: Profile,
