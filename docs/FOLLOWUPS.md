@@ -197,3 +197,77 @@ The current implementation uses `map_or_else` to translate
 idiomatic rusqlite pattern is `query_row(...).optional()` with the
 `OptionalExtension` trait. Pure refactoring — not blocking anything; touch
 this code only when there's a real reason to.
+
+---
+
+## `output::shard` slices by bytes; panics on non-ASCII input
+
+**Found in:** T8 code quality review (opus).
+**Disposition:** Latent footgun; defer to whenever a `VideoId` newtype is introduced.
+**Trigger to revisit:** any task that introduces a typed `VideoId`, or any task that begins accepting video IDs from a source other than the DDP-JSON parser.
+
+`src/output/mod.rs::shard` does `&video_id[len-2..]`, which slices by bytes.
+For multi-byte UTF-8 input where `len-2` lands mid-codepoint, this panics.
+Real TikTok video IDs are ASCII digits and Plan A's parser only ever produces
+those, so this is not exploitable today. The function takes `&str` rather
+than a `VideoId` newtype, so the ASCII-only contract is implicit.
+
+The natural fix arrives whenever the project introduces a `VideoId` newtype
+(probably Plan B or Plan C, when DB rows and trait boundaries start passing
+IDs around as values rather than `&str`). At that point, `shard` should be
+a method on `VideoId` and the byte-slice is safe by construction.
+
+Lowest-cost stopgap before then: add a debug assertion or a one-line doc
+comment stating the ASCII-only contract.
+
+---
+
+## `output::cleanup_tmp_files` minor cleanups: missing context, overcounted removals
+
+**Found in:** T8 code quality review (opus).
+**Disposition:** Cosmetic; bundle with the next real edit to this function.
+**Trigger to revisit:** any task that touches `cleanup_tmp_files`, or T15 (init-cmd) when wiring the call site.
+
+Two small inconsistencies in `src/output/artifacts.rs::cleanup_tmp_files`:
+
+1. The inner `std::fs::read_dir(&path)?` and the surrounding `entry?` /
+   `shard_entry?` lines bubble up raw `io::Error` without path context. The
+   outer `read_dir(transcripts_root)` is contextualized via `with_context`.
+   On a permission-denied inside one shard dir, the operator gets a path-less
+   error.
+
+2. `let _ = std::fs::remove_file(&p); removed += 1;` increments
+   unconditionally. If `remove_file` fails (permission, EBUSY), the returned
+   count overstates the cleanup. Best-effort semantics are fine; the count
+   just shouldn't claim success it didn't achieve.
+
+Neither is a behavioural bug for Plan A's happy-path single-process loop.
+Worth fixing when this function next gets touched.
+
+---
+
+## `output::shard_distributes_uniformly` test rationale is reversed
+
+**Found in:** T8 code quality review (opus).
+**Disposition:** Cosmetic; comment is misleading but the assertion still
+catches the stated regression.
+**Trigger to revisit:** any future edit to the test, or whenever a
+`VideoId` newtype absorbs `shard()` and the test moves with it.
+
+`src/output/mod.rs::shard_distributes_uniformly` uses monotonic counter
+input (`base + i` for `i in 0..10000`), which produces exactly 100 items per
+last-two-digits bucket. The ±50% assertion (`50..=150`) passes with a
+margin of 0%, not because the bound is "lenient for synthetic input" as the
+comment claims.
+
+The comment says "real Snowflake IDs would be tighter" — that's reversed.
+Real Snowflake low bits are pseudorandom; their per-bucket variance over
+10k samples is Poisson-like (~10% std dev), so real IDs would be looser,
+not tighter, than the artificially perfect counter cycle.
+
+The test still catches the "uses high digits instead of low" regression via
+the `counts.len() == 100` assertion (high digits are time-clustered, so a
+high-digits implementation would collapse to 1-2 buckets). The bounds check
+is decorative for this input; either tighten it (e.g., assert exact equality
+to 100) or replace the input with a PRNG-driven sample to exercise the
+bound meaningfully.
