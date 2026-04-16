@@ -102,6 +102,44 @@ Plan B will add: `tokio-util` (CancellationToken if we end up wanting graceful s
 
 ---
 
+## Architectural Decision Records (ADRs)
+
+ADRs live in `docs/decisions/` and are managed via the [adg](https://github.com/adr/ad-guidance-tool) tool. The format is MADR.
+
+**When to write an ADR (mandatory triggers):**
+
+- Structural patterns (file/module organization, abstraction boundaries)
+- Tooling/process choices (linting policy, suppression conventions, hook designs)
+- Intentional deviations from the plan's verbatim instructions
+- Cross-task patterns where the decision will affect multiple future tasks
+
+**Skip ADR for:**
+
+- Implementation detail that follows obviously from the plan
+- Bug fix (unless the fix establishes a pattern)
+- Trivial cleanup
+
+**Authorship:** The controller writes the ADR. Subagents that encounter a multi-alternative decision should pause and report back as `BLOCKED` or `DONE_WITH_CONCERNS` rather than choosing silently — they lack the project context to record reasoning effectively.
+
+**Mechanics:**
+
+```bash
+adg add --model docs/decisions --title "<slug-safe title>"
+# Avoid /, ;, [ in titles — adg's slugger interprets / as a path separator.
+adg edit --model docs/decisions --id 000N \
+  --question "..." \
+  --option "..." [--option "..."]* \
+  --criteria "..."
+adg decide --model docs/decisions --id 000N \
+  --option "..." --rationale "..."
+```
+
+**Reviewer obligation:** Every spec compliance reviewer and every code quality reviewer MUST scan `docs/decisions/` for decided ADRs (`ls docs/decisions/AD*.md` or `adg list --model docs/decisions`) and verify the work-under-review does not violate any decided ADR. Flag violations as blocking issues. New ADRs added since the previous task may also be relevant — don't assume the list is stable across tasks.
+
+**Cleanup discipline (per ADR 0002):** When a task consumes a previously-dead type — one carrying `#[allow(dead_code)]` whose justification comment names this task as the future reader — remove the now-stale `#[allow(dead_code)]` as part of your work. Periodic backstop: `rg "allow\(dead_code\)" src/` to spot stale suppressions.
+
+---
+
 ## Task Index
 
 | # | File | Subject |
