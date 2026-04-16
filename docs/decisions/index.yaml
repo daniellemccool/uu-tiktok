@@ -47,3 +47,15 @@ decisions:
             - author: Danielle McCool
               date: "2026-04-16 23:26:03"
               comment: "1"
+    "0005":
+        adr_id: "0005"
+        title: Use Cargo test-helpers feature for library items needed by integration tests
+        status: decided
+        tags: []
+        links:
+            precedes: []
+            succeeds: []
+        comments:
+            - author: Danielle McCool
+              date: "2026-04-16 23:49:54"
+              comment: "1"

@@ -338,36 +338,3 @@ Resolution options:
 
 Per AD0002's cleanup discipline — periodic backstop is `rg "allow\(dead_code\)" src/`.
 
----
-
-## Cargo `test-helpers` feature pattern is undocumented
-
-**Found in:** T9 code quality review (opus).
-**Disposition:** Worth promoting to an ADR before T10/T11/T12 add more
-cfg-gated library items.
-**Trigger to revisit:** before T10 (claim helpers will likely want the same
-treatment), or at the Plan A / Plan B reassessment point.
-
-T9 introduced the first Cargo feature flag in the crate
-(`test-helpers = []`) and the per-test `required-features = ["test-helpers"]`
-attribute. The pattern works correctly and matches Rust idiom for "library
-item visible to integration tests but not to library consumers." But:
-
-- The choice is undocumented in any ADR. Alternatives considered (sub-crate;
-  `pub(crate)` + `#[cfg(test)]` re-export module; in-crate unit tests only)
-  were ruled out implicitly via the brief, not on record.
-- The pattern interacts with AD0002: `cargo clippy --all-targets
-  --features test-helpers` enables the feature in the bin compilation too,
-  which is why the new `#[allow(dead_code)]` is needed on `VideoRow` and
-  `get_video_for_test`. The justification comments capture this in code,
-  but the policy is not in any ADR.
-- T10, T11, T12 will likely add more cfg-gated test helpers (row inspectors
-  after `claim_next`, fake fetcher impls). An ADR locking the convention
-  now would prevent ad-hoc divergence.
-
-Suggested ADR scope: when to add a `test-helpers`-gated item vs. an
-in-crate-only `#[cfg(test)]` item; whether such items are `pub` or
-`pub(crate)`; how their dead-code suppression interacts with AD0002;
-whether `Cargo.toml` should keep adding `[[test]] required-features`
-blocks per integration-test file or accept that all integration tests
-require the feature.
