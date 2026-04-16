@@ -34,6 +34,23 @@ fn schema_version_is_recorded() {
     assert_eq!(version, "1");
 }
 
+// Coverage-fill test (per ADR 0003): the behavior already works; this test
+// just guards against regressions to the QueryReturnedNoRows mapping in
+// Store::read_meta. NOT a TDD cycle.
+#[test]
+fn read_meta_returns_none_for_missing_key() {
+    let tmp = TempDir::new().unwrap();
+    let store = Store::open(&tmp.path().join("state.sqlite")).expect("open");
+    let result = store
+        .read_meta("nonexistent_key")
+        .expect("read_meta succeeds even when key is absent");
+    assert!(
+        result.is_none(),
+        "expected None for missing key, got {:?}",
+        result
+    );
+}
+
 #[test]
 fn pragma_journal_mode_is_wal() {
     let tmp = TempDir::new().unwrap();

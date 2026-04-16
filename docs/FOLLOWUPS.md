@@ -129,3 +129,71 @@ For Plan B's failure classification, distinguishing OOM-kill from
 user-cancelled from segfault matters for retry decisions. Plan B should expand
 `CommandOutcome` with a `signal: Option<i32>` field (Unix-only via cfg), or
 introduce a richer `CompletionStatus` enum.
+
+---
+
+## `Store::open` records `schema_version` but never reads-and-checks it
+
+**Found in:** T7 code quality review (opus).
+**Disposition:** Deferred to Plan B (first schema change).
+**Trigger to revisit:** any task that changes `state::schema::SCHEMA_SQL`.
+
+`Store::open` writes the schema version to `meta` on first run via
+`INSERT OR IGNORE`, but no subsequent open verifies the stored version against
+the current `SCHEMA_VERSION` constant. A Plan B `Store::open` running against
+a Plan A database would silently keep the old schema (CREATE IF NOT EXISTS
+doesn't migrate).
+
+The decision the project will eventually need to make is multi-alternative —
+worth recording as a proper ADR before Plan B's first schema change:
+
+- (a) Hard-fail `Store::open` on version mismatch
+- (b) Auto-migrate forward via numbered migration scripts
+- (c) Refuse to open older versions but allow newer (read-only)
+- (d) Log warning on mismatch, proceed anyway (current behavior — silent)
+
+Lowest-cost stopgap before Plan B: a one-line `tracing::warn!` in `Store::open`
+when stored version differs from `SCHEMA_VERSION`. Converts silent drift into
+a loud signal at near-zero cost.
+
+---
+
+## `Store::pragma_string` visibility is `pub`, not `pub(crate)`
+
+**Found in:** T7 code quality review (opus).
+**Disposition:** Defer to bin/lib structural reassessment (per ADR 0002).
+**Trigger to revisit:** Plan A reassessment point — when bin/lib pattern is decided.
+
+`Store::pragma_string` is currently `pub` (matches the per-task file's
+verbatim spec text). It builds `format!("PRAGMA {}", name)` because PRAGMA
+names cannot be parameterized in SQLite. Today the only caller is the
+`pragma_journal_mode_is_wal` integration test passing the literal
+`"journal_mode"`, but `pub` visibility means external library consumers
+could pass attacker-controlled or malformed names.
+
+Two reasonable fixes when this is revisited:
+
+- Lower visibility to `pub(crate)` (matches `conn`/`conn_mut`); only the
+  integration test would need adjustment, possibly via a `test-helpers`
+  feature gate.
+- Switch the implementation to `rusqlite::Connection::pragma_query_value`,
+  which validates the pragma name internally.
+
+Coupled to AD0002's deferred bin/lib structural decision because the
+"is this part of the public library API?" question depends on whether the
+project ends up thin-binary, fat-library or stays with the dual-`mod`
+pattern.
+
+---
+
+## `Store::read_meta` could use `OptionalExtension::optional()`
+
+**Found in:** T7 code quality review (opus).
+**Disposition:** Style improvement; defer indefinitely.
+**Trigger to revisit:** any future edit to `Store::read_meta`.
+
+The current implementation uses `map_or_else` to translate
+`QueryReturnedNoRows` to `Ok(None)`. Functionally correct but verbose. The
+idiomatic rusqlite pattern is `query_row(...).optional()` with the
+`OptionalExtension` trait. Pure refactoring — not blocking anything; touch
+this code only when there's a real reason to.

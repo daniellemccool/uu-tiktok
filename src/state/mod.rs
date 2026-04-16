@@ -86,3 +86,43 @@ impl Store {
         &mut self.conn
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// Real-TDD bug-fix test (per ADR 0003). SQLite's `TEXT PRIMARY KEY` does
+    /// NOT imply NOT NULL — only `INTEGER PRIMARY KEY` (rowid alias) does. The
+    /// schema must declare NOT NULL explicitly. This test guards against
+    /// regressing the schema to the implicit-NULL form.
+    #[test]
+    fn null_video_id_rejected_by_videos_schema() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(&tmp.path().join("state.sqlite")).unwrap();
+        let result = store.conn().execute(
+            "INSERT INTO videos
+             (video_id, source_url, canonical, status, first_seen_at, updated_at)
+             VALUES (NULL, 'x', 0, 'pending', 0, 0)",
+            [],
+        );
+        assert!(
+            result.is_err(),
+            "expected NOT NULL constraint to reject NULL video_id, but insert succeeded"
+        );
+    }
+
+    /// Same SQLite quirk applies to `meta.key`. Guard it too.
+    #[test]
+    fn null_meta_key_rejected_by_meta_schema() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(&tmp.path().join("state.sqlite")).unwrap();
+        let result = store
+            .conn()
+            .execute("INSERT INTO meta (key, value) VALUES (NULL, 'x')", []);
+        assert!(
+            result.is_err(),
+            "expected NOT NULL constraint to reject NULL meta.key, but insert succeeded"
+        );
+    }
+}

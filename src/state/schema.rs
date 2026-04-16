@@ -7,7 +7,10 @@ pub const SCHEMA_VERSION: &str = "1";
 #[allow(dead_code)]
 pub const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS videos (
-    video_id            TEXT PRIMARY KEY,
+    -- TEXT PRIMARY KEY does NOT imply NOT NULL in SQLite (only INTEGER PRIMARY
+    -- KEY does, as a rowid alias). Declare NOT NULL explicitly. Guarded by
+    -- state::tests::null_video_id_rejected_by_videos_schema.
+    video_id            TEXT PRIMARY KEY NOT NULL,
     source_url          TEXT NOT NULL,
     canonical           INTEGER NOT NULL,
     status              TEXT NOT NULL CHECK (status IN
@@ -50,7 +53,9 @@ CREATE TABLE IF NOT EXISTS video_events (
 CREATE INDEX IF NOT EXISTS idx_video_events_video ON video_events (video_id, at);
 
 CREATE TABLE IF NOT EXISTS meta (
-    key   TEXT PRIMARY KEY,
+    -- See videos.video_id comment for the NOT NULL rationale.
+    -- Guarded by state::tests::null_meta_key_rejected_by_meta_schema.
+    key   TEXT PRIMARY KEY NOT NULL,
     value TEXT NOT NULL
 );
 "#;
