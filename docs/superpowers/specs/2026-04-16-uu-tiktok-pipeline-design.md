@@ -208,11 +208,11 @@ uu-tiktok/
        fn open(path: &Path) -> Result<Self>;
 
        // Ingest
-       fn upsert_video(&self, video_id: &VideoId, source_url: &Url, canonical: bool) -> Result<()>;
-       fn upsert_watch_history(&self, respondent_id: &str, video_id: &VideoId, watched_at: UnixTime, in_window: bool) -> Result<()>;
-       fn enqueue_short_link(&self, respondent_id: &str, short_url: &Url, watched_at: UnixTime) -> Result<()>;
+       fn upsert_video(&self, video_id: &VideoId, source_url: &Url, canonical: bool) -> Result<()>;     // INSERT OR IGNORE; never modifies existing rows
+       fn upsert_watch_history(&self, respondent_id: &str, video_id: &VideoId, watched_at: UnixTime, in_window: bool) -> Result<()>;   // INSERT OR IGNORE on (respondent_id, video_id, watched_at)
+       fn enqueue_short_link(&self, respondent_id: &str, short_url: &Url, watched_at: UnixTime, in_window: bool) -> Result<()>;
        fn pending_short_links(&self) -> Result<Vec<PendingShortLink>>;
-       fn promote_resolved_short_link(&self, short_url: &Url, video_id: &VideoId, in_window_resolver: impl Fn(UnixTime) -> bool) -> Result<usize>;
+       fn promote_resolved_short_link(&self, short_url: &Url, video_id: &VideoId) -> Result<usize>;   // uses the in_window stored at enqueue time
        fn record_resolution_failure(&self, short_url: &Url, error: &str) -> Result<()>;
 
        // Pipeline
@@ -308,10 +308,12 @@ Ingest writes resolvable URLs (forms 1 and 2 from `canonical::canonicalize_url`)
 A resolution pass runs automatically at the start of `process` (and is also exposed as the standalone `uu-tiktok resolve-short-links` subcommand for operator use). For each distinct `short_url` in `pending_resolutions`:
 
 1. One `HEAD` request with redirects followed; parse the canonical URL from the final `Location`; extract `video_id`.
-2. In one SQLite transaction: `INSERT OR IGNORE INTO videos`, `INSERT INTO watch_history` for every respondent row matching that short_url, `DELETE FROM pending_resolutions WHERE short_url = ?`.
+2. In one SQLite transaction: `INSERT OR IGNORE INTO videos`, `INSERT OR IGNORE INTO watch_history` for every respondent row matching that short_url (using the `in_window` stored at enqueue time), `DELETE FROM pending_resolutions WHERE short_url = ?`.
 3. On failure: `UPDATE pending_resolutions SET last_error = ?, last_attempted_at = ?`. Rows stay in `pending_resolutions`; operator can re-run the resolver later.
 
 Every distinct short URL is resolved exactly once, regardless of how many respondents have it. The main pipeline never sees unresolved short links.
+
+`in_window` is stored on every `pending_resolutions` row at enqueue time (using the same window flags ingest used for direct rows), so window flags never need to be re-supplied at resolve time. `recompute-window` updates both `watch_history.in_window` and `pending_resolutions.in_window` in one pass — short links awaiting resolution get their flag updated alongside everything else.
 
 ### Eligibility and ordering
 
@@ -382,6 +384,49 @@ uu-tiktok export-manifest --out ./manifest.parquet
 
 ## Schemas
 
+### DDP-extracted JSON input format
+
+The pipeline does **not** read raw TikTok DDP zips. It reads the JSON output of the donation platform's TikTok extractor (the future modification of `~/src/d3i-infra/data-donation-task`). One file per respondent.
+
+**Filename convention** (from the donation platform's storage layer):
+
+```
+assignment={N}_task={N}_participant={ID}_source=tiktok_key={N}-tiktok.json
+```
+
+`respondent_id` is parsed from the `participant=` segment. Other key=value pairs are captured by ingest as metadata on the watch_history rows but not used as keys. Real production filenames will have actual participant IDs (e.g., Prolific PIDs); the test fixture uses `participant=preview`.
+
+**File contents**: a JSON array where each element is an object with a single section-name key plus a `deleted row count` field. The pipeline consumes the `tiktok_watch_history` section in v1; other sections are tolerated (not parsed) for forward-compatibility.
+
+```json
+[
+  {"tiktok_activity_summary": [...], "deleted row count": "0"},
+  {"tiktok_settings": [...], "deleted row count": "0"},
+  {"tiktok_watch_history": [
+    {"Date": "2026-02-03 13:20:15",
+     "Link": "https://www.tiktokv.com/share/video/7583050189527682336/"},
+    ...
+  ], "deleted row count": "0"},
+  {"tiktok_favorite_videos": [...], "deleted row count": "0"},
+  {"tiktok_following": [...], "deleted row count": "0"},
+  {"tiktok_like_list": [...], "deleted row count": "0"},
+  {"tiktok_searches": [...], "deleted row count": "0"},
+  {"tiktok_share_history": [...], "deleted row count": "0"},
+  {"tiktok_comments": [...], "deleted row count": "0"}
+]
+```
+
+**`tiktok_watch_history` row fields**:
+
+- `Date`: format `YYYY-MM-DD HH:MM:SS`. Assumed UTC (no timezone marker in TikTok DDP exports). Parsed to `INTEGER` unix seconds for `watch_history.watched_at`. Parse failures are logged at WARN and the row skipped (not Bug-class — DDP exports occasionally contain malformed entries).
+- `Link`: TikTok URL. Observed in current exports: exclusively form 1 (`https://www.tiktokv.com/share/video/{19-digit-id}/`). Pipeline still routes through `canonical::canonicalize_url` so other forms (and short links) are handled correctly when TikTok changes their export format.
+
+**Reference fixture**: `tests/fixtures/ddp/20260416_test/assignment=500_task=1221_participant=preview_source=tiktok_key=1776350251592-tiktok.json` — one file with ~200 watch_history rows, plus rows in the other (currently-unused) sections. Useful for ingest unit tests and end-to-end dev runs.
+
+**Edge cases observed in this fixture**:
+- Same `(Date, Link)` repeated within one respondent's history (consecutive replays or export quirk). Handled by `INSERT OR IGNORE` on the `watch_history` PK.
+- `tiktok_favorite_videos`, `tiktok_like_list`, `tiktok_share_history` also carry video Links. **Out of scope for v1** — the analysis defines exposure as "watched," and these are subsets/related-acts of watching that would muddy the metric. Could be added later via a `--include-non-watched` style flag.
+
 ### SQLite (`state.sqlite`)
 
 ```sql
@@ -431,11 +476,14 @@ CREATE INDEX idx_videos_pending
 -- Short links awaiting redirect resolution. Resolved at the start of `process`
 -- (or via the `resolve-short-links` subcommand). One distinct short_url is
 -- resolved exactly once regardless of how many respondents share it.
+-- in_window is computed at ENQUEUE time (matching watch_history), not at
+-- resolve time, so window flags never need to be re-supplied later.
 CREATE TABLE pending_resolutions (
     id                 INTEGER PRIMARY KEY,
     respondent_id      TEXT NOT NULL,
     short_url          TEXT NOT NULL,
     watched_at         INTEGER NOT NULL,            -- unix seconds
+    in_window          INTEGER NOT NULL,            -- computed at ingest, mirrors watch_history.in_window
     last_attempted_at  INTEGER,
     last_error         TEXT,
     UNIQUE (respondent_id, short_url, watched_at)
@@ -595,10 +643,10 @@ struct Config {
 
     stale_claim_threshold: Duration,             // dev=30s, prod=1h
 
-    keep_raw_metadata: bool,                     // default true
+    keep_raw_metadata: bool,                     // default true in dev, false in prod (~100KB/video × 1M videos = 100GB)
     fetch_comments: bool,                        // default false in scrape mode
 
-    worker_id: String,
+    worker_id: String,                           // default: "{hostname}-{pid}" so multi-instance distinguishes naturally
     batch_label: Option<String>,                 // optional provenance label
 
     window: Option<DateRange>,                   // absolute analysis window; None = no filter
@@ -666,13 +714,16 @@ Walk `pending_resolutions`, follow each distinct short URL's redirect, upsert ca
 
 ### `recompute-window`
 
-Recompute `watch_history.in_window` flags for all rows using the supplied absolute dates. One-shot; does not re-read DDP files. Run when the researcher revises the analysis window.
+Recompute `in_window` flags on `watch_history` and `pending_resolutions` using the supplied absolute dates. One-shot; does not re-read DDP files. Run when the researcher revises the analysis window.
 
 ```
---window-start <YYYY-MM-DD>     Optional
---window-end   <YYYY-MM-DD>     Optional
+--window-start <YYYY-MM-DD>     One of --window-start, --window-end, or --clear is REQUIRED
+--window-end   <YYYY-MM-DD>
+--clear                         Explicitly opt into "no filter" (sets in_window=1 for all rows)
 --dry-run                       Report how many rows would change
 ```
+
+Refuses to run with no window flags and no `--clear` (silently wiping the entire study's window filtering would be too easy a mistake).
 
 ### `process`
 
@@ -723,11 +774,10 @@ Operator escape hatch. Resets `in_progress` rows back to `pending`.
 
 ### `export-manifest`
 
-Read-only derivation of Parquet manifest from SQLite + transcripts directory.
+Read-only derivation of Parquet manifest from SQLite + transcripts directory. Always includes all rows regardless of status (the researcher can filter post-hoc on `status` in the parquet).
 
 ```
 --out <PATH>                    REQUIRED
---include-failed                Include failed_terminal rows (default: true)
 --respondent-filter <PATH>      Optional CSV of respondent_ids to include
 ```
 
@@ -876,15 +926,21 @@ Behavior: log at ERROR with full context, set abort flag, worker exits with `Err
 
 Per-video commit sequence — invariant: **never mark `succeeded` before durable artifact visibility.**
 
-1. Write `{video_id}.txt.tmp`, `{video_id}.json.tmp`, `{video_id}.metadata.json.tmp` (and `.metadata.raw.json.tmp`, `.comments.json.tmp` when applicable)
+All `.tmp` files live under `{transcripts}/.tmp/{video_id}/` — same filesystem as the final destinations, so `rename(2)` is atomic. Final artifacts land at the per-video paths in `{transcripts}/` (see Schemas). At `process` startup, any leftover `{transcripts}/.tmp/*` directories from prior crashes are deleted before claiming work — they're never the canonical artifact (which only exists post-rename), so removing them is safe.
+
+1. Write `{transcripts}/.tmp/{video_id}/{video_id}.txt.tmp`, `.json.tmp`, `.metadata.json.tmp` (and `.metadata.raw.json.tmp`, `.comments.json.tmp` when applicable)
 2. `fsync` each temp file
-3. `rename` each to its final name
+3. `rename` each to its final destination under `{transcripts}/`
 4. `fsync` the parent directory
 5. `Store::mark_succeeded` (videos UPDATE + video_events INSERT in one transaction)
 
 Failure modes:
 - Artifact files exist but row is `in_progress` → next run treats as stale claim, re-fetches, idempotent overwrite.
 - Row says `succeeded` but file missing → cannot happen by construction.
+
+### Audio retention
+
+Audio files (`.wav`, intermediate `.m4a` if produced separately by yt-dlp) are deleted from `.tmp/` after a successful `mark_succeeded`. On any failure path (terminal, retryable, or Bug-class crash), the audio file is moved to `{transcripts}/.failed_audio/{video_id}.wav` for diagnosis. Cleanup of `.failed_audio/` is operator-driven — no automatic reaping. Operator sweeps the directory manually when the diagnostic data is no longer useful, or via a cron job tuned to whatever retention they prefer.
 
 ### Stale-claim recovery
 
@@ -987,11 +1043,18 @@ Anything that requires GPU or `large-v3` is tested manually on SURF before deplo
 
 ```
 tests/fixtures/
-├── ddp/                          # Sample DDP JSONs: minimal, realistic, edge cases (short links, malformed)
+├── ddp/                          # Donation-extractor JSON output, one file per respondent
+│   └── 20260416_test/
+│       └── assignment=500_task=1221_participant=preview_source=tiktok_key=1776350251592-tiktok.json
+│                                 # Real fixture: ~200 watch_history rows, all canonical URLs,
+│                                 # includes intra-respondent duplicates. See "DDP-extracted
+│                                 # JSON input format" under Schemas.
 ├── audio/                        # Short public-domain WAV for whisper.cpp smoke tests
 ├── yt_dlp_responses/             # Captured stderr from real failures (deleted, private, geo, 429, etc.)
 └── api_responses/                # Placeholder; populated when API access lands
 ```
+
+Additional fixtures to add as edge cases are discovered: minimal valid file (one row), short-link-bearing file, malformed-Date file, mixed-URL-form file.
 
 ### Explicitly NOT tested
 
@@ -1030,3 +1093,12 @@ Nightly Rust added later if a real reason emerges.
 | No `ApiFetcher` stub in v1 | Stub would rot; trait + enum are sufficient to land the implementation later without restructuring. |
 | `video_id` as TEXT throughout | Avoids JSON precision-loss bugs at boundaries; yt-dlp and API both serialize as strings. |
 | Multi-GPU = two binary instances, shared SQLite | Simpler than per-binary GPU pool; SQLite atomic claims serialize work-acquisition correctly. |
+| `pending_resolutions` stores `in_window` at enqueue time (mirrors `watch_history`) | Avoids "resolved short links silently get the wrong window flag because window flags weren't supplied at resolve time." `recompute-window` updates both tables together. |
+| `recompute-window` requires explicit window flags or `--clear` | Default-no-args would silently wipe filtering for the entire study — too easy a mistake. Force a deliberate choice. |
+| Audio kept on failure, deleted on success; cleanup is operator-driven | Pipeline knows nothing about retention policy (manual, cron, never); operator handles `.failed_audio/` directly. |
+| Tmp files under `{transcripts}/.tmp/{video_id}/` (same FS as finals) | Guarantees `rename(2)` atomicity for the commit contract. Startup deletes leftover `.tmp/` from prior crashes. |
+| `keep_raw_metadata` defaults false in prod | ~100 KB × 1M videos = 100 GB of raw payloads otherwise. Keep available for forensics in dev; opt-in only at prod scale. |
+| `--include-failed` removed from `export-manifest`; manifest always includes all rows | The researcher can filter on `status` post-hoc; removing the flag eliminates a confusing default-true boolean. |
+| Pipeline reads donation-extractor JSON (not raw DDP) | Donation-side script is the natural format owner; this pipeline consumes its output. Format documented under "DDP-extracted JSON input format". |
+| `respondent_id` parsed from `participant=` segment of filename | Donation platform stores per-respondent files with key=value naming; `participant=` is the canonical PID location. |
+| `Date` field in DDP-extracted JSON treated as UTC | DDP exports carry no timezone marker; UTC is the safest default and matches TikTok's documented export convention. |

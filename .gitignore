@@ -24,3 +24,6 @@ manifest.parquet
 
 # Claude session state
 .claude/projects/
+
+# Other tool session state
+.codex
