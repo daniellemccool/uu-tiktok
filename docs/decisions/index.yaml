@@ -35,3 +35,15 @@ decisions:
             - author: Danielle McCool
               date: "2026-04-16 22:27:00"
               comment: "1"
+    "0004":
+        adr_id: "0004"
+        title: Transcript output sharding by last two digits of video id
+        status: decided
+        tags: []
+        links:
+            precedes: []
+            succeeds: []
+        comments:
+            - author: Danielle McCool
+              date: "2026-04-16 23:26:03"
+              comment: "1"
