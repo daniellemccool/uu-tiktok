@@ -145,7 +145,7 @@ uu-tiktok/
 
 ### Five boundaries called out explicitly
 
-1. **`fetcher::VideoFetcher` trait** — the boundary that survives the API swap.
+1. **`fetcher::VideoFetcher` trait** — the boundary that survives the API swap. Carries the full artifact set, not just the primary audio/transcript: every successful fetch produces normalized metadata (and optionally raw payload + comments), so the trait must surface those alongside the audio or transcript.
 
    ```rust
    #[async_trait]
@@ -154,19 +154,48 @@ uu-tiktok/
            &self,
            video_id: &VideoId,
            source_url: &Url,
+           opts: &AcquireOptions,
        ) -> Result<Acquisition, FetchError>;
    }
 
+   struct AcquireOptions {
+       fetch_comments: bool,
+       keep_raw_metadata: bool,
+   }
+
    enum Acquisition {
+       Successful(SuccessfulAcquisition),
+       Unavailable(UnavailableReason),
+   }
+
+   struct SuccessfulAcquisition {
+       primary: AcquiredPrimary,                  // audio file or ready transcript
+       metadata: NormalizedMetadata,              // always populated; the union schema
+       raw_metadata: Option<serde_json::Value>,   // only when keep_raw_metadata = true
+       comments: Option<CommentsBundle>,          // only when fetch_comments = true
+   }
+
+   enum AcquiredPrimary {
        AudioFile(PathBuf),
        ReadyTranscript(TranscriptPayload),
-       Unavailable(UnavailableReason),
    }
 
    struct TranscriptPayload {
        text: String,
        language: Option<String>,
        source_attribution: &'static str,  // "api_voice_to_text" etc.
+   }
+
+   struct NormalizedMetadata {
+       // Union schema across yt-dlp info JSON and Research API video object.
+       // Field-by-field mapping in the Schemas section below.
+   }
+
+   struct CommentsBundle {
+       fetched_count: u32,
+       reported_total: Option<u32>,   // API supplies this; yt-dlp does not
+       is_complete: bool,
+       comments: Vec<Comment>,
    }
    ```
 
@@ -177,20 +206,30 @@ uu-tiktok/
    ```rust
    impl Store {
        fn open(path: &Path) -> Result<Self>;
+
+       // Ingest
+       fn upsert_video(&self, video_id: &VideoId, source_url: &Url, canonical: bool) -> Result<()>;
+       fn upsert_watch_history(&self, respondent_id: &str, video_id: &VideoId, watched_at: UnixTime, in_window: bool) -> Result<()>;
+       fn enqueue_short_link(&self, respondent_id: &str, short_url: &Url, watched_at: UnixTime) -> Result<()>;
+       fn pending_short_links(&self) -> Result<Vec<PendingShortLink>>;
+       fn promote_resolved_short_link(&self, short_url: &Url, video_id: &VideoId, in_window_resolver: impl Fn(UnixTime) -> bool) -> Result<usize>;
+       fn record_resolution_failure(&self, short_url: &Url, error: &str) -> Result<()>;
+
+       // Pipeline
        fn claim_next(&self, worker_id: &str) -> Result<Option<Claim>>;
        fn mark_succeeded(&self, video_id: &VideoId, artifacts: SuccessArtifacts) -> Result<()>;
        fn mark_retryable_failure(&self, video_id: &VideoId, kind: RetryableKind, ctx: FailureContext) -> Result<()>;
        fn mark_terminal_failure(&self, video_id: &VideoId, reason: UnavailableReason, ctx: Option<FailureContext>) -> Result<()>;
        fn requeue_retryables(&self, filter: RequeueFilter) -> Result<usize>;
        fn reset_stale_claims(&self, older_than: Duration) -> Result<usize>;
-       fn upsert_video(&self, ...) -> Result<()>;
-       fn upsert_watch_history(&self, ...) -> Result<()>;
    }
    ```
 
    Every state-mutating method commits the videos UPDATE + the video_events INSERT in a single SQLite transaction. There is no scenario where the row updates but the event log is missing.
 
-3. **`canonical::canonicalize_url`** — pure function, no I/O. Returns `CanonicalVideoId(String)` for forms 1 and 2 (regex extracts the 19-digit ID), `NeedsResolution(Url)` for short links (forms 3 and 4). The dedup primitive; gets the heaviest test coverage.
+   `mark_retryable_failure` writes to the `last_retryable_*` columns; `mark_terminal_failure` writes to the `terminal_*` columns. The two pairs are mutually exclusive in normal operation (a row's status determines which pair is meaningful). Both are persisted so the CLI can surface them without re-deriving from the event log.
+
+3. **`canonical::canonicalize_url`** — pure function, no I/O. Returns `CanonicalVideoId(String)` for forms 1 and 2 (regex extracts the 19-digit ID), `NeedsResolution(Url)` for short links (forms 3 and 4). The dedup primitive; gets the heaviest test coverage. Short-link rows do not enter `videos` directly — they go to `pending_resolutions` and are resolved by a pre-flight step (see Data flow).
 
 4. **`output` module** — every artifact write is atomic (write to `.tmp`, fsync, rename, fsync parent dir). Crash-safety guarantee: a transcript file on disk is always complete; a partially-written file would be the `.tmp` and the SQLite row would still be `in_progress`, so the next run re-does that video.
 
@@ -262,36 +301,51 @@ The system is **operator-driven, not scheduler-driven**. Retries happen only whe
           └─────────────────────────────────┘
 ```
 
+### Short-link resolution (pre-flight)
+
+Ingest writes resolvable URLs (forms 1 and 2 from `canonical::canonicalize_url`) directly to `videos` + `watch_history`. Short links (forms 3 and 4: `vm.tiktok.com/*`, `www.tiktok.com/t/*`) go to `pending_resolutions` along with the respondent and watched_at.
+
+A resolution pass runs automatically at the start of `process` (and is also exposed as the standalone `uu-tiktok resolve-short-links` subcommand for operator use). For each distinct `short_url` in `pending_resolutions`:
+
+1. One `HEAD` request with redirects followed; parse the canonical URL from the final `Location`; extract `video_id`.
+2. In one SQLite transaction: `INSERT OR IGNORE INTO videos`, `INSERT INTO watch_history` for every respondent row matching that short_url, `DELETE FROM pending_resolutions WHERE short_url = ?`.
+3. On failure: `UPDATE pending_resolutions SET last_error = ?, last_attempted_at = ?`. Rows stay in `pending_resolutions`; operator can re-run the resolver later.
+
+Every distinct short URL is resolved exactly once, regardless of how many respondents have it. The main pipeline never sees unresolved short links.
+
 ### Eligibility and ordering
 
-`claim_next` selects only pending rows:
+`claim_next` selects only pending rows, ordered by a real column so the partial index is useful:
 
 ```sql
 SELECT video_id FROM videos
 WHERE status = 'pending'
-ORDER BY rowid ASC
+ORDER BY first_seen_at ASC, video_id ASC
 LIMIT 1;
 ```
 
-Inside a `BEGIN IMMEDIATE` transaction so concurrent workers cannot grab the same row. Status flipped to `in_progress`, `claimed_by` and `claimed_at` set, `attempt_count` incremented, `claimed` event recorded — all in the same transaction.
+Inside a `BEGIN IMMEDIATE` transaction so concurrent workers cannot grab the same row. Status flipped to `in_progress`, `claimed_by` and `claimed_at` set, `attempt_count` incremented, `claimed` event recorded — all in the same transaction. The partial index `idx_videos_pending (status, first_seen_at, video_id) WHERE status = 'pending'` serves both the WHERE filter and the ORDER BY without a sort, and stays small (only the rows actually eligible for claiming).
 
 ### Where each transition happens
 
 | Trigger | Module | Effect |
 |---|---|---|
-| New video seen in DDP | `ingest` | `INSERT OR IGNORE` → `pending` |
+| Ingest sees resolvable URL | `ingest` | `upsert_video` + `upsert_watch_history`; videos row is `pending` |
+| Ingest sees short link | `ingest` | `enqueue_short_link` → `pending_resolutions` |
+| Short link resolved | `pipeline` (startup) or `resolve-short-links` subcommand | `promote_resolved_short_link`: upsert videos row, insert watch_history rows for every respondent, delete pending_resolutions |
+| Short link unresolvable | as above | `record_resolution_failure`: row stays in `pending_resolutions` |
 | Worker claims | `pipeline` (via `claim_next`) | `pending` → `in_progress`; `attempt_count++` |
-| `Acquisition::AudioFile` → transcribe OK | `pipeline` (transcribe worker) | `in_progress` → `succeeded` |
-| `Acquisition::ReadyTranscript` | `pipeline` (download worker, short-circuit) | `in_progress` → `succeeded` |
-| `Acquisition::Unavailable(reason)` | `pipeline` (download worker, short-circuit) | `in_progress` → `failed_terminal` |
-| `Err(FetchError)` → `Retryable` | `pipeline` | `in_progress` → `failed_retryable` |
+| `Acquisition::Successful` with `AcquiredPrimary::AudioFile` → transcribe OK | `pipeline` (transcribe worker) | `in_progress` → `succeeded` |
+| `Acquisition::Successful` with `AcquiredPrimary::ReadyTranscript` | `pipeline` (download worker, short-circuit) | `in_progress` → `succeeded` |
+| `Acquisition::Unavailable(reason)` | `pipeline` (download worker, short-circuit) | `in_progress` → `failed_terminal`; writes `terminal_reason` + `terminal_message` |
+| `Err(FetchError)` → `Retryable` | `pipeline` | `in_progress` → `failed_retryable`; writes `last_retryable_kind` + `last_retryable_message` |
 | `Err(FetchError)` → `Bug` | `pipeline` | panic; coordinated shutdown |
 | Stale `in_progress` row | `pipeline` (startup) | `in_progress` → `pending` (no `attempt_count` change) |
-| Operator: `requeue-retryables` | `cli` | `failed_retryable` → `pending` |
+| Operator: `requeue-retryables` | `cli` | `failed_retryable` → `pending`; `last_retryable_*` retained for history |
 
 ### Short-circuit asymmetry
 
-Only the `AudioFile` path traverses the channel and the GPU. `ReadyTranscript` and `Unavailable` outcomes complete inside the download worker (write artifacts + `mark_succeeded`, or `mark_terminal_failure`) without touching the GPU. Keeps the transcribe worker focused on its one job.
+Only the `AcquiredPrimary::AudioFile` path traverses the channel and the GPU. `ReadyTranscript` and `Unavailable` outcomes complete inside the download worker (write artifacts + `mark_succeeded`, or `mark_terminal_failure`) without touching the GPU. Keeps the transcribe worker focused on its one job.
 
 ### Bug supervision
 
@@ -301,21 +355,26 @@ Any `ClassifiedFailure::Bug` from any worker triggers coordinated shutdown of th
 
 ```bash
 # One-time
-uu-tiktok init                                          # create state.sqlite
+uu-tiktok init                                                         # create state.sqlite
 
 # Each batch (operator workflow)
-uu-tiktok ingest --inbox ./inbox                        # idempotent
-uu-tiktok process --profile prod --worker-id gpu0
+uu-tiktok ingest --inbox ./inbox \
+                 --window-start 2026-01-01 --window-end 2026-04-01     # idempotent
+uu-tiktok process --profile prod --worker-id gpu0                       # short-link resolution runs at startup
 uu-tiktok status
 
 # Between batches: when a new wave of donations arrives
-uu-tiktok ingest --inbox ./inbox                        # picks up new files
-uu-tiktok requeue-retryables --older-than 12h           # optional
+uu-tiktok ingest --inbox ./inbox \
+                 --window-start 2026-01-01 --window-end 2026-04-01     # picks up new files
+uu-tiktok requeue-retryables --older-than 12h                           # optional
 uu-tiktok process --profile prod --worker-id gpu0
 
 # After all expected batches processed and a week has passed
-uu-tiktok requeue-retryables                            # final wave
+uu-tiktok requeue-retryables                                            # final wave
 uu-tiktok process --profile prod --worker-id gpu0
+
+# Window changed mid-study? Recompute in_window flags without re-ingesting
+uu-tiktok recompute-window --window-start 2026-01-01 --window-end 2026-05-01
 
 # Final export
 uu-tiktok export-manifest --out ./manifest.parquet
@@ -333,16 +392,23 @@ PRAGMA busy_timeout = 5000;
 
 CREATE TABLE videos (
     video_id            TEXT PRIMARY KEY,        -- 19-digit numeric ID as TEXT (preserve precision)
-    source_url          TEXT NOT NULL,            -- representative URL fed to yt-dlp; back-filled for short-link fetches
-    canonical           INTEGER NOT NULL,         -- 1 if URL parsed inline, 0 if resolved via fetcher
+    source_url          TEXT NOT NULL,            -- representative URL fed to yt-dlp; for short-link origins, the resolved canonical URL
+    canonical           INTEGER NOT NULL,         -- 1 if URL parsed inline at ingest, 0 if resolved from a short link
 
     status              TEXT NOT NULL CHECK (status IN
                           ('pending','in_progress','succeeded','failed_terminal','failed_retryable')),
     claimed_by          TEXT,
     claimed_at          INTEGER,                  -- unix seconds
     attempt_count       INTEGER NOT NULL DEFAULT 0,
-    last_error_kind     TEXT,
-    last_error_message  TEXT,
+
+    -- For status = 'failed_retryable':
+    last_retryable_kind     TEXT,                 -- e.g. 'RateLimited', 'OOM'
+    last_retryable_message  TEXT,                 -- stderr excerpt or context
+
+    -- For status = 'failed_terminal':
+    terminal_reason         TEXT,                 -- e.g. 'Deleted', 'Private'
+    terminal_message        TEXT,                 -- optional context
+
     succeeded_at        INTEGER,
 
     duration_s          REAL,
@@ -356,7 +422,25 @@ CREATE TABLE videos (
     updated_at          INTEGER NOT NULL
 );
 
-CREATE INDEX idx_videos_pending ON videos (rowid) WHERE status = 'pending';
+-- Partial index supporting both the WHERE filter and the ORDER BY in claim_next.
+-- Stays small: only rows actually eligible for claiming.
+CREATE INDEX idx_videos_pending
+    ON videos (status, first_seen_at, video_id)
+    WHERE status = 'pending';
+
+-- Short links awaiting redirect resolution. Resolved at the start of `process`
+-- (or via the `resolve-short-links` subcommand). One distinct short_url is
+-- resolved exactly once regardless of how many respondents share it.
+CREATE TABLE pending_resolutions (
+    id                 INTEGER PRIMARY KEY,
+    respondent_id      TEXT NOT NULL,
+    short_url          TEXT NOT NULL,
+    watched_at         INTEGER NOT NULL,            -- unix seconds
+    last_attempted_at  INTEGER,
+    last_error         TEXT,
+    UNIQUE (respondent_id, short_url, watched_at)
+);
+CREATE INDEX idx_pending_resolutions_url ON pending_resolutions (short_url);
 
 CREATE TABLE watch_history (
     respondent_id  TEXT NOT NULL,
@@ -486,7 +570,8 @@ The full original payload (yt-dlp info JSON or API response) goes into the sibli
 | has_transcript    | bool            | derived: status='succeeded'         | no       |
 | has_metadata      | bool            | derived: file exists                | no       |
 | has_comments      | bool            | derived: file exists                | no       |
-| last_error_kind   | string          | videos.last_error_kind              | yes      |
+| last_retryable_kind | string        | videos.last_retryable_kind          | yes      |
+| terminal_reason   | string          | videos.terminal_reason              | yes      |
 | attempt_count     | int32           | videos.attempt_count                | no       |
 
 Generated by reading SQLite + checking artifact file presence. Read-only with respect to live state; safe to run while `process` is running (WAL).
@@ -516,7 +601,12 @@ struct Config {
     worker_id: String,
     batch_label: Option<String>,                 // optional provenance label
 
-    analysis_window: Option<Duration>,           // e.g. 90 days; None = no filter
+    window: Option<DateRange>,                   // absolute analysis window; None = no filter
+}
+
+struct DateRange {
+    start: Option<NaiveDate>,                    // inclusive
+    end: Option<NaiveDate>,                      // inclusive
 }
 ```
 
@@ -553,23 +643,47 @@ Apply pending schema migrations.
 
 ### `ingest`
 
-Walk `--inbox`, parse DDP JSONs, canonicalize URLs, upsert into `videos` and `watch_history`. Idempotent.
+Walk `--inbox`, parse DDP JSONs, canonicalize URLs. Resolvable URLs upserted into `videos` + `watch_history`; short links enqueued to `pending_resolutions`. Idempotent.
 
 ```
---analysis-window <DURATION>    e.g. 90d; sets in_window flag (default: none = all true)
---batch-label <NAME>            Optional provenance label
+--window-start <YYYY-MM-DD>     Absolute start of analysis window (inclusive); optional
+--window-end   <YYYY-MM-DD>     Absolute end of analysis window (inclusive); optional
+--batch-label  <NAME>           Optional provenance label
 --dry-run                       Report counts without writing
+```
+
+If neither `--window-start` nor `--window-end` is given, all rows get `in_window = 1` (no filter). The window is computed once at ingest from absolute dates and never recomputed silently. Re-ingesting the same DDP file produces identical `in_window` flags as long as the window flags are unchanged. To change the window after ingest, use `recompute-window` (below) — explicit, one-shot, auditable.
+
+### `resolve-short-links`
+
+Walk `pending_resolutions`, follow each distinct short URL's redirect, upsert canonical videos + watch_history rows, delete the resolved entries. Failed resolutions stay in `pending_resolutions` for the next attempt. Idempotent. Runs automatically at the start of `process` unless `--no-resolve` is passed there.
+
+```
+--max <N>                       Cap how many distinct URLs to resolve in this run
+--timeout <DURATION>            Per-URL HEAD timeout (default: 10s)
+--dry-run
+```
+
+### `recompute-window`
+
+Recompute `watch_history.in_window` flags for all rows using the supplied absolute dates. One-shot; does not re-read DDP files. Run when the researcher revises the analysis window.
+
+```
+--window-start <YYYY-MM-DD>     Optional
+--window-end   <YYYY-MM-DD>     Optional
+--dry-run                       Report how many rows would change
 ```
 
 ### `process`
 
-Run a batch. Claims `pending` rows only; no scheduler eligibility logic. Exits cleanly when no pending rows remain.
+Run a batch. Resolves any pending short links at startup (unless `--no-resolve`), then claims `pending` rows only — no scheduler eligibility logic. Exits cleanly when no pending rows remain.
 
 ```
 --worker-id <NAME>              Required for multi-instance (default: hostname)
 --max-videos <N>                Stop after N (succeeded + failed)
 --time-budget <DURATION>        Stop accepting new claims after this elapsed
 --no-stale-sweep                Skip startup reset_stale_claims (debugging only)
+--no-resolve                    Skip startup short-link resolution (debugging only)
 --batch-label <NAME>            Optional provenance label
 ```
 
@@ -578,21 +692,22 @@ Emits a progress line every 30s; per-video INFO log lines for stage transitions.
 ### `status`
 
 ```
-(no args)                       Counts by status
+(no args)                       Counts by status; counts of pending_resolutions
 --video-id <ID>                 Full event history for one video
 --respondent-id <ID>            Per-respondent summary
---errors                        List failed_terminal videos with last_error_kind/message
---retryable                     List failed_retryable videos
+--errors                        List failed_terminal videos with terminal_reason / terminal_message
+--retryable                     List failed_retryable videos with last_retryable_kind / last_retryable_message
+--unresolved                    List pending_resolutions rows with last_error
 --json                          Output as JSON
 ```
 
 ### `requeue-retryables`
 
-Operator command; flips selected `failed_retryable` rows back to `pending`.
+Operator command; flips selected `failed_retryable` rows back to `pending`. Retains `last_retryable_*` for history.
 
 ```
 --older-than <DURATION>         Only requeue if videos.updated_at older than this
---error-kinds <KIND,KIND,...>   Only requeue rows whose last_error_kind matches
+--error-kinds <KIND,KIND,...>   Only requeue rows whose last_retryable_kind matches
 --max <N>                       Cap the number requeued
 --dry-run
 ```
@@ -676,10 +791,22 @@ fn classify_transcribe_error(err: &TranscribeError) -> ClassifiedFailure;
 ### Dispatch
 
 ```rust
-match acquire(video_id, source_url).await {
-    Ok(Acquisition::AudioFile(path))           => /* hand off to transcribe stage */,
-    Ok(Acquisition::ReadyTranscript(payload))  => commit_transcript_and_succeed(payload),
-    Ok(Acquisition::Unavailable(reason))       => store.mark_terminal_failure(video_id, reason, None),
+match acquire(video_id, source_url, &opts).await {
+    Ok(Acquisition::Successful(s)) => match s.primary {
+        AcquiredPrimary::AudioFile(path) => {
+            // Hand off to transcribe stage. Metadata, raw payload, comments
+            // travel with the job so the transcribe worker writes all artifacts
+            // before mark_succeeded.
+            channel.send(TranscribeJob { video_id, path, success: s }).await;
+        }
+        AcquiredPrimary::ReadyTranscript(payload) => {
+            // Short-circuit: download worker writes all artifacts and commits.
+            commit_artifacts_and_succeed(video_id, payload, s);
+        }
+    },
+    Ok(Acquisition::Unavailable(reason)) => {
+        store.mark_terminal_failure(video_id, reason, None);
+    }
     Err(fetch_err) => match classify_fetch_error(&fetch_err) {
         ClassifiedFailure::Retryable { kind, ctx } => store.mark_retryable_failure(video_id, kind, ctx),
         ClassifiedFailure::Bug { ctx }              => abort_with_bug(ctx),
@@ -816,14 +943,30 @@ struct FakeFetcher {
 }
 
 enum FakeOutcome {
-    AudioFile(PathBuf),
-    ReadyTranscript(TranscriptPayload),
+    Successful {
+        primary: AcquiredPrimary,                // AudioFile(path) or ReadyTranscript(payload)
+        metadata: NormalizedMetadata,
+        raw_metadata: Option<serde_json::Value>,
+        comments: Option<CommentsBundle>,
+    },
     Unavailable(UnavailableReason),
     Error(FetchError),
 }
 ```
 
-Each test owns its temp dir of pre-staged WAV fixtures (when needed for AudioFile outcomes).
+Each test owns its temp dir of pre-staged WAV fixtures (when needed for `AudioFile` outcomes).
+
+### Tier 2 — additional tests for the new fixes
+
+| What | Notes |
+|------|-------|
+| Short-link resolution promotes correctly | Insert `pending_resolutions` rows for one short URL across N respondents; run resolver with a fake redirect-follower; verify one `videos` row + N `watch_history` rows + zero remaining `pending_resolutions` rows |
+| Short-link resolution failure path | Insert `pending_resolutions`; resolver fails; verify row stays with `last_error` populated; `videos` and `watch_history` unchanged |
+| `claim_next` ordering uses `(first_seen_at, video_id)` | Insert pending rows with controlled `first_seen_at`; verify claim order |
+| Partial index actually exists and is used | Test asserts `EXPLAIN QUERY PLAN` references `idx_videos_pending` |
+| Failure persistence: retryable vs terminal | After `mark_retryable_failure`, verify `last_retryable_kind` populated and `terminal_reason` NULL; after `mark_terminal_failure`, the inverse |
+| `recompute-window` updates `in_window` correctly | Insert watch_history rows with various `watched_at`; run with new window; verify flags |
+| `Acquisition::Successful` carries metadata through to artifacts | Pipeline test: scripted `Successful` outcome with non-trivial metadata; verify `transcripts/{id}.metadata.json` contains the expected fields |
 
 ### Tier 3 — Smoke tests against real tools (`#[ignore]`, run via `cargo test -- --ignored`, slow)
 
