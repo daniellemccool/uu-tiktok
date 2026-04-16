@@ -471,3 +471,48 @@ changed the SELECT predicate to `WHERE status IN ('pending',
 end-to-end fake-fetcher tests will likely cover this incidentally;
 if they don't, add a one-liner here.
 
+---
+
+## `YtDlpFetcher::acquire` error mapping and yt-dlp output-filename coupling
+
+**Found in:** T11 code quality review (opus).
+**Disposition:** Deferred. Findings 1–2 fold into Plan B's failure-classification
+work; finding 3 is hardening; finding 4 is Plan C scope.
+**Trigger to revisit:** Plan B's `RetryableKind` / `UnavailableReason` design
+(findings 1, 2); Plan B's fetch-orchestrator hardening (finding 3); Plan C's
+short-link resolution (finding 4).
+
+Four concerns in `src/fetcher/ytdlp.rs::acquire`, none blocking for Plan A's
+serial happy path:
+
+1. **`create_dir_all` failure → `FetchError::NetworkError`.** Filesystem
+   ENOSPC / EACCES is not a network condition. Will misclassify into Plan B's
+   network-backoff path. Extends the existing T6 follow-up on
+   `From<RunError>`'s coarse mappings — same root cause (`FetchError`
+   variants too coarse), additional symptom (the mismapping now happens inside
+   `acquire` itself, not just at the `From` boundary).
+
+2. **Post-success `wav_path.exists() == false` → `FetchError::ParseError`.**
+   `ParseError` means "couldn't parse tool output." This case is "tool
+   succeeded but artifact convention was violated" — closer to a tool-contract
+   postcondition error. Same Plan B classification work catches this. (The
+   `FakeFetcher` missing-fixture error reuses `ParseError` similarly; that one
+   is test-only and cosmetic.)
+
+3. **Tight coupling to yt-dlp's `{video_id}.wav` output filename.** The
+   `wav_path.exists()` check assumes yt-dlp's `--audio-format wav` +
+   `%(ext)s` template always produces exactly `{video_id}.wav`. If yt-dlp
+   emits a sanitized variant, intermediate partial files, or a suffix for
+   collisions, the check fails despite a successful exit. A robustness
+   improvement: scan `video_dir` for any `.wav` after success, or glob
+   `{video_id}.*.wav`. Defer to Plan B's fetch-orchestrator hardening.
+
+4. **`source_url` is bound as the last positional arg with no `--` separator.**
+   Today this is safe because `source_url` always comes from `Canonical::Valid`
+   whose regex anchors `^https?://`. Plan C will introduce short-link
+   resolution that produces resolved URLs from external sources; an attacker-
+   controlled or malformed URL beginning with `-` could be reinterpreted as a
+   yt-dlp flag. One-line defense: insert `"--".into()` immediately before
+   `source_url.to_string()` in the `args` vector. Land this when Plan C wires
+   resolved URLs into the fetcher pipeline.
+
