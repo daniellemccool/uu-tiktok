@@ -83,3 +83,15 @@ decisions:
             - author: Danielle McCool
               date: "2026-04-17 08:26:50"
               comment: "1"
+    "0008":
+        adr_id: "0008"
+        title: Pipeline writes transcript artifacts before mark_succeeded for crash-recovery durability
+        status: decided
+        tags: []
+        links:
+            precedes: []
+            succeeds: []
+        comments:
+            - author: Danielle McCool
+              date: "2026-04-17 09:43:12"
+              comment: "1"
