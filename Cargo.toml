@@ -33,3 +33,7 @@ required-features = ["test-helpers"]
 [[test]]
 name = "state_claims"
 required-features = ["test-helpers"]
+
+[[test]]
+name = "ingest"
+required-features = ["test-helpers"]

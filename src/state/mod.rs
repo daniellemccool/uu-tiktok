@@ -7,9 +7,6 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 pub use schema::SCHEMA_VERSION;
 
-// Helper for upsert_video / upsert_watch_history. Bin compilation re-includes
-// state via `mod state;` (per AD0002) and has no caller until T13 (ingest cmd).
-#[allow(dead_code)]
 fn unix_now() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -40,9 +37,6 @@ pub struct Store {
 }
 
 impl Store {
-    // Binary crate wires `mod state;` but doesn't call Store yet — T13 (ingest),
-    // T14 (process), and T15 (init) are the first callers.
-    #[allow(dead_code)]
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)
             .with_context(|| format!("opening SQLite database at {}", path.display()))?;
@@ -114,17 +108,18 @@ impl Store {
         &mut self.conn
     }
 
-    // T13 (ingest cmd) is the first bin consumer; integration tests at
-    // tests/state_ingest.rs already exercise this in the lib compilation.
-    #[allow(dead_code)]
+    /// Returns the number of rows actually inserted (1 for new, 0 for an
+    /// idempotent re-upsert of an existing row). Symmetric with
+    /// `upsert_watch_history`.
     pub fn upsert_video(
         &mut self,
         video_id: &str,
         source_url: &str,
         canonical: bool,
-    ) -> Result<()> {
+    ) -> Result<usize> {
         let now = unix_now();
-        self.conn
+        let changed = self
+            .conn
             .execute(
                 "INSERT OR IGNORE INTO videos
                  (video_id, source_url, canonical, status,
@@ -133,12 +128,9 @@ impl Store {
                 params![video_id, source_url, canonical as i64, now],
             )
             .with_context(|| format!("upserting video {}", video_id))?;
-        Ok(())
+        Ok(changed)
     }
 
-    // T13 (ingest cmd) is the first bin consumer; integration tests at
-    // tests/state_ingest.rs already exercise this in the lib compilation.
-    #[allow(dead_code)]
     pub fn upsert_watch_history(
         &mut self,
         respondent_id: &str,

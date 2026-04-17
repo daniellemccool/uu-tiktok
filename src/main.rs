@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 
 mod canonical;
@@ -6,6 +6,7 @@ mod cli;
 mod config;
 mod errors;
 mod fetcher;
+mod ingest;
 mod output;
 mod process;
 mod state;
@@ -22,8 +23,21 @@ async fn main() -> Result<()> {
         cli::Command::Init => {
             tracing::info!("init: not yet implemented (Task 7+)");
         }
-        cli::Command::Ingest { dry_run: _ } => {
-            tracing::info!("ingest: not yet implemented (Task 13)");
+        cli::Command::Ingest { dry_run } => {
+            let mut store = state::Store::open(&cfg.state_db).context("opening state DB")?;
+            if dry_run {
+                tracing::info!("dry-run: not yet implemented; running real ingest");
+            }
+            let stats = ingest::ingest(&cfg.inbox, &mut store).context("ingest failed")?;
+            tracing::info!(
+                files = stats.files_processed,
+                videos = stats.unique_videos_seen,
+                history = stats.watch_history_rows_processed,
+                duplicates = stats.watch_history_duplicates,
+                short_links_skipped = stats.short_links_skipped,
+                invalid_urls_skipped = stats.invalid_urls_skipped,
+                "ingest complete"
+            );
         }
         cli::Command::Process { max_videos: _ } => {
             tracing::info!("process: not yet implemented (Task 14)");
