@@ -712,3 +712,41 @@ removed after success (`!fake_wav.exists()`); (b) a re-run (or
 `max_videos: Some(2)` against one pending row) returns `claimed: 0`
 with no further side-effects.
 
+---
+
+## `output::shard_dir` is unused; allow comment falsely names T13/T14 as consumers
+
+**Found in:** T15 code quality review (opus) — Plan A close-out AD0002 audit.
+**Disposition:** Dead helper; delete or find a real caller.
+**Trigger to revisit:** Plan A → Plan B reassessment, or next edit to
+`src/output/mod.rs`.
+
+`src/output/mod.rs::shard_dir` carries `#[allow(dead_code)]` with the comment
+"consumed by T13/T14 (ingest-cmd, process-cmd)". Neither task consumes it;
+`pipeline.rs` binds a local `shard_dir` variable but calls
+`opts.transcripts_root.join(shard(&claim.video_id))` directly. The function
+has no real caller outside its own unit test. Either delete it, or have
+`pipeline.rs` call it instead of re-doing the join inline. Bundles naturally
+with the `VideoId` newtype refactor that AD0004 anticipates.
+
+---
+
+## `tests/e2e_real_tools.rs` doc-comment promised UU_TIKTOK_MODEL env var override
+
+**Found in:** T15 code quality review (opus); fixed inline (doc-comment
+amended to remove the false claim).
+**Disposition:** Doc-comment lie removed; a real env-var override remains
+useful but not yet implemented.
+**Trigger to revisit:** any task that needs to point e2e_real_tools at a
+non-default model path (alternate quantization, larger model for accuracy
+testing, model under a sibling project, etc.).
+
+T15's e2e_real_tools.rs originally promised "override via UU_TIKTOK_MODEL"
+but the binary reads no such env var; `config::Config::from_args` hardcodes
+`whisper_model_path: PathBuf::from("./models/ggml-tiny.en.bin")` for the Dev
+profile. The doc-comment was rewritten in the T15 close-out cleanup to
+remove the false claim; the actual env-var override is deferred. Adding it
+is one line in `cli.rs` (`#[arg(long, env = "UU_TIKTOK_MODEL", default_value = "./models/ggml-tiny.en.bin")]`)
+plus a corresponding field in `Config::from_args`. Land when there's a real
+need.
+

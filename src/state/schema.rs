@@ -1,10 +1,5 @@
-// Read by T7 (Store::open) only; SCHEMA_VERSION also re-exported from state/mod.rs.
-// The binary crate wires `mod state;` but doesn't call Store yet — T13/T14/T15 will.
-#[allow(dead_code)]
 pub const SCHEMA_VERSION: &str = "1";
 
-// Applied at every Store::open; binary crate dead until T13/T14/T15.
-#[allow(dead_code)]
 pub const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS videos (
     -- TEXT PRIMARY KEY does NOT imply NOT NULL in SQLite (only INTEGER PRIMARY
