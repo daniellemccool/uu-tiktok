@@ -64,8 +64,6 @@ impl Store {
         Ok(Self { conn })
     }
 
-    // Dead in binary crate until T13/T14/T15 wire Store.
-    #[allow(dead_code)]
     pub fn read_meta(&self, key: &str) -> Result<Option<String>> {
         let result = self
             .conn
@@ -84,7 +82,9 @@ impl Store {
         Ok(result)
     }
 
-    // Dead in binary crate until T13/T14/T15 wire Store.
+    // No bin consumer; only the cfg(test) `pragma_journal_mode_is_wal`
+    // integration test calls this. Visibility/API decision deferred per
+    // FOLLOWUPS (`Store::pragma_string` visibility) and AD0002.
     #[allow(dead_code)]
     pub fn pragma_string(&self, name: &str) -> Result<String> {
         let value: String = self

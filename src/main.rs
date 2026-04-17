@@ -22,7 +22,23 @@ async fn main() -> Result<()> {
 
     match cli.command {
         cli::Command::Init => {
-            tracing::info!("init: not yet implemented (Task 7+)");
+            let path = &cfg.state_db;
+            if path.exists() {
+                let store = state::Store::open(path)?;
+                if let Some(version) = store.read_meta("schema_version")? {
+                    tracing::info!(
+                        path = %path.display(),
+                        version = version.as_str(),
+                        "state.sqlite already initialized; nothing to do"
+                    );
+                    return Ok(());
+                }
+            }
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).context("creating state.sqlite parent dir")?;
+            }
+            let _store = state::Store::open(path)?;
+            tracing::info!(path = %path.display(), "state.sqlite initialized");
         }
         cli::Command::Ingest { dry_run } => {
             let mut store = state::Store::open(&cfg.state_db).context("opening state DB")?;

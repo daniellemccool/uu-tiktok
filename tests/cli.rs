@@ -20,3 +20,31 @@ fn init_subcommand_help_works() {
         .assert()
         .success();
 }
+
+#[test]
+fn init_creates_state_sqlite() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db = tmp.path().join("state.sqlite");
+
+    Command::cargo_bin("uu-tiktok")
+        .unwrap()
+        .args(["--state-db", db.to_str().unwrap(), "init"])
+        .assert()
+        .success();
+
+    assert!(db.exists());
+}
+
+#[test]
+fn init_is_idempotent() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db = tmp.path().join("state.sqlite");
+
+    for _ in 0..2 {
+        Command::cargo_bin("uu-tiktok")
+            .unwrap()
+            .args(["--state-db", db.to_str().unwrap(), "init"])
+            .assert()
+            .success();
+    }
+}
