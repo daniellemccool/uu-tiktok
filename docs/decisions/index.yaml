@@ -59,3 +59,27 @@ decisions:
             - author: Danielle McCool
               date: "2026-04-16 23:49:54"
               comment: "1"
+    "0006":
+        adr_id: "0006"
+        title: Store mutators return Result of usize for row-change count
+        status: decided
+        tags: []
+        links:
+            precedes: []
+            succeeds: []
+        comments:
+            - author: Danielle McCool
+              date: "2026-04-17 08:26:50"
+              comment: "1"
+    "0007":
+        adr_id: "0007"
+        title: Stats structs use input-side counters with verb-named fields
+        status: decided
+        tags: []
+        links:
+            precedes: []
+            succeeds: []
+        comments:
+            - author: Danielle McCool
+              date: "2026-04-17 08:26:50"
+              comment: "1"
