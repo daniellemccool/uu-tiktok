@@ -8,6 +8,7 @@ mod errors;
 mod fetcher;
 mod ingest;
 mod output;
+mod pipeline;
 mod process;
 mod state;
 mod transcribe;
@@ -39,12 +40,58 @@ async fn main() -> Result<()> {
                 "ingest complete"
             );
         }
-        cli::Command::Process { max_videos: _ } => {
-            tracing::info!("process: not yet implemented (Task 14)");
+        cli::Command::Process { max_videos } => {
+            let mut store = state::Store::open(&cfg.state_db).context("opening state DB")?;
+            std::fs::create_dir_all(&cfg.transcripts).context("creating transcripts dir")?;
+            // Tmp cleanup at startup
+            let removed = output::artifacts::cleanup_tmp_files(&cfg.transcripts)?;
+            if removed > 0 {
+                tracing::info!(removed, "cleaned up leftover .tmp files");
+            }
+
+            let work_dir = cfg.transcripts.join(".work");
+            std::fs::create_dir_all(&work_dir).context("creating work dir")?;
+
+            let fetcher = fetcher::ytdlp::YtDlpFetcher::new(&work_dir, cfg.ytdlp_timeout);
+            let model_path = cfg.whisper_model_path.clone();
+            let use_gpu = cfg.whisper_use_gpu;
+            let threads = cfg.whisper_threads;
+            let timeout = cfg.transcribe_timeout;
+
+            let opts = pipeline::ProcessOptions {
+                worker_id: format!("{}-{}", hostname_or_default(), std::process::id()),
+                transcripts_root: cfg.transcripts.clone(),
+                max_videos,
+                transcriber: Box::new(move |path| {
+                    let opts = transcribe::TranscribeOptions {
+                        model_path: model_path.clone(),
+                        use_gpu,
+                        threads,
+                        timeout,
+                    };
+                    let path = path.to_path_buf();
+                    Box::pin(async move { transcribe::transcribe(&path, &opts).await })
+                }),
+            };
+
+            let stats = pipeline::run_serial(&mut store, &fetcher, opts).await?;
+            tracing::info!(
+                claimed = stats.claimed,
+                succeeded = stats.succeeded,
+                failed = stats.failed,
+                "process complete"
+            );
+            if stats.claimed == 0 {
+                std::process::exit(3);
+            }
         }
     }
 
     Ok(())
+}
+
+fn hostname_or_default() -> String {
+    std::env::var("HOSTNAME").unwrap_or_else(|_| "host".to_string())
 }
 
 fn init_tracing(format: cli::LogFormat) {

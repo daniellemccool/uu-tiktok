@@ -37,3 +37,10 @@ required-features = ["test-helpers"]
 [[test]]
 name = "ingest"
 required-features = ["test-helpers"]
+
+[[test]]
+name = "pipeline_fakes"
+required-features = ["test-helpers"]
+
+[[test]]
+name = "e2e_real_tools"

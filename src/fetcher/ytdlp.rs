@@ -7,8 +7,6 @@ use crate::errors::FetchError;
 use crate::fetcher::{Acquisition, VideoFetcher};
 use crate::process::{run, CommandSpec};
 
-// T14 (process serial loop) is the first bin consumer.
-#[allow(dead_code)]
 pub struct YtDlpFetcher {
     /// Directory under which yt-dlp writes per-video subdirectories. Caller
     /// supplies a writable path under `transcripts_root`.
@@ -17,8 +15,6 @@ pub struct YtDlpFetcher {
 }
 
 impl YtDlpFetcher {
-    // T14 (process serial loop) is the first bin consumer.
-    #[allow(dead_code)]
     pub fn new(work_dir: impl AsRef<Path>, timeout: Duration) -> Self {
         Self {
             work_dir: work_dir.as_ref().to_path_buf(),

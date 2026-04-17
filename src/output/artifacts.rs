@@ -6,8 +6,6 @@ use anyhow::{Context, Result};
 
 /// Atomic write for one file: write to `{path}.tmp`, fsync, rename to `{path}`,
 /// fsync the parent directory. Caller is responsible for parent existence.
-// consumed by T11 (video-fetcher) and T14 (process-cmd)
-#[allow(dead_code)]
 pub fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
     let parent = path
         .parent()
@@ -44,8 +42,6 @@ pub fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
 
 /// Sweep all `*.tmp` files under the transcripts root. Called at process
 /// startup so leftover tmp files from crashed runs don't accumulate.
-// consumed by T14/T15 (process-cmd, init-cmd)
-#[allow(dead_code)]
 pub fn cleanup_tmp_files(transcripts_root: &Path) -> Result<usize> {
     if !transcripts_root.exists() {
         return Ok(0);

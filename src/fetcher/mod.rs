@@ -6,16 +6,12 @@ use async_trait::async_trait;
 
 use crate::errors::FetchError;
 
-// T14 (process serial loop) is the first bin consumer.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub enum Acquisition {
     /// Audio file written to disk; pipeline will hand to whisper.cpp next.
     AudioFile(PathBuf),
 }
 
-// T14 (process serial loop) is the first bin consumer.
-#[allow(dead_code)]
 #[async_trait]
 pub trait VideoFetcher: Send + Sync {
     async fn acquire(&self, video_id: &str, source_url: &str) -> Result<Acquisition, FetchError>;

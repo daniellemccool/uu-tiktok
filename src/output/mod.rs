@@ -6,8 +6,6 @@ use std::path::{Path, PathBuf};
 /// Snowflake low digits are essentially random, giving uniform 100-bucket
 /// distribution. The single source of truth for path layout — no other
 /// module hard-codes a path scheme.
-// consumed by T13/T14 (ingest-cmd, process-cmd)
-#[allow(dead_code)]
 pub fn shard(video_id: &str) -> &str {
     let len = video_id.len();
     if len < 2 {

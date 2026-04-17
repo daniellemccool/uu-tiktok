@@ -4,8 +4,6 @@ use std::time::Duration;
 use crate::errors::TranscribeError;
 use crate::process::{run, CommandSpec};
 
-// T14 (process serial loop) is the first bin consumer.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct TranscribeOptions {
     pub model_path: PathBuf,
@@ -14,8 +12,6 @@ pub struct TranscribeOptions {
     pub timeout: Duration,
 }
 
-// T14 (process serial loop) is the first bin consumer.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct TranscribeResult {
     pub text: String,
@@ -25,8 +21,6 @@ pub struct TranscribeResult {
 
 /// Run whisper.cpp on the given WAV. Returns the transcript text plus
 /// whatever metadata whisper.cpp reports (language detected, duration).
-// T14 (process serial loop) is the first bin consumer.
-#[allow(dead_code)]
 pub async fn transcribe(
     audio_path: &Path,
     opts: &TranscribeOptions,
@@ -101,8 +95,6 @@ pub async fn transcribe(
     })
 }
 
-// Helper for transcribe; T14 (process serial loop) is the first bin consumer transitively. Cfg(test) tests exercise it directly.
-#[allow(dead_code)]
 fn parse_language(stderr: &str) -> Option<String> {
     // Look for "auto-detected language: <code>"
     for line in stderr.lines() {

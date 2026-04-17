@@ -2,8 +2,6 @@ use std::time::Duration;
 
 use thiserror::Error;
 
-// Dead code allowed: FetchError variants are used by the runner (T6) and fetcher (T11).
-#[allow(dead_code)]
 #[derive(Debug, Error)]
 pub enum FetchError {
     #[error("subprocess `{tool}` timed out after {duration:?}")]
@@ -26,8 +24,6 @@ pub enum FetchError {
     ParseError(String),
 }
 
-// Dead code allowed: TranscribeError variants are used by the transcribe step (T12).
-#[allow(dead_code)]
 #[derive(Debug, Error)]
 pub enum TranscribeError {
     #[error("whisper.cpp timed out after {duration:?}")]

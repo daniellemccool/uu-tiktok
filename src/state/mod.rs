@@ -157,8 +157,6 @@ impl Store {
 }
 
 /// Represents a successfully claimed video row, returned by `claim_next`.
-// T14 (process serial loop) is the first bin consumer.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct Claim {
     pub video_id: String,
@@ -167,8 +165,6 @@ pub struct Claim {
 }
 
 /// Artifacts written to the database upon successful transcription.
-// T14 (process serial loop) is the first bin consumer.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct SuccessArtifacts {
     pub duration_s: Option<f64>,
@@ -182,8 +178,6 @@ impl Store {
     ///
     /// Uses `BEGIN IMMEDIATE` to serialize concurrent claim attempts across
     /// multiple connections to the same SQLite file.
-    // T14 (process serial loop) is the first bin consumer; integration tests at tests/state_claims.rs exercise this in the lib compilation.
-    #[allow(dead_code)]
     pub fn claim_next(&mut self, worker_id: &str) -> Result<Option<Claim>> {
         let now = unix_now();
         let tx = self
@@ -236,17 +230,22 @@ impl Store {
     }
 
     /// Mark a video as succeeded and record a `succeeded` event, atomically.
-    // T14 (process serial loop) is the first bin consumer; integration tests exercise this in the lib compilation.
-    #[allow(dead_code)]
-    pub fn mark_succeeded(&mut self, video_id: &str, artifacts: SuccessArtifacts) -> Result<()> {
+    /// Returns the row-change count from the videos UPDATE per AD0006. Without
+    /// a `WHERE status = 'in_progress'` predicate (FOLLOWUPS-tracked, deferred
+    /// to Plan B's state-machine work), this count is symbolic — always 1 for
+    /// any matching video_id. Once Plan B adds the predicate, callers can
+    /// detect "0 means the row was not in_progress (stale claim?)" without a
+    /// separate query.
+    pub fn mark_succeeded(&mut self, video_id: &str, artifacts: SuccessArtifacts) -> Result<usize> {
         let now = unix_now();
         let tx = self
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .context("begin immediate for mark_succeeded")?;
 
-        tx.execute(
-            "UPDATE videos
+        let changed = tx
+            .execute(
+                "UPDATE videos
              SET status = 'succeeded',
                  succeeded_at = ?2,
                  duration_s = ?3,
@@ -255,16 +254,16 @@ impl Store {
                  transcript_source = ?6,
                  updated_at = ?2
              WHERE video_id = ?1",
-            params![
-                video_id,
-                now,
-                artifacts.duration_s,
-                artifacts.language_detected,
-                artifacts.fetcher,
-                artifacts.transcript_source,
-            ],
-        )
-        .with_context(|| format!("update videos for succeeded {}", video_id))?;
+                params![
+                    video_id,
+                    now,
+                    artifacts.duration_s,
+                    artifacts.language_detected,
+                    artifacts.fetcher,
+                    artifacts.transcript_source,
+                ],
+            )
+            .with_context(|| format!("update videos for succeeded {}", video_id))?;
 
         tx.execute(
             "INSERT INTO video_events (video_id, at, event_type, worker_id, detail_json)
@@ -273,7 +272,7 @@ impl Store {
         )?;
 
         tx.commit().context("commit mark_succeeded")?;
-        Ok(())
+        Ok(changed)
     }
 }
 

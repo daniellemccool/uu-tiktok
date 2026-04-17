@@ -7,9 +7,6 @@ use tokio::time::timeout;
 
 use crate::errors::FetchError;
 
-// Dead code allowed: CommandSpec, CommandOutcome, RunError, run, and the From impl
-// are consumed by T11 (YtDlpFetcher) and T12 (transcribe step).
-#[allow(dead_code)]
 #[derive(Debug)]
 pub struct CommandSpec<'a> {
     pub program: &'static str,
@@ -26,16 +23,21 @@ pub struct CommandSpec<'a> {
     pub redact_arg_indices: &'a [usize],
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct CommandOutcome {
     pub exit_code: i32,
+    // Plan A's bin consumers (YtDlpFetcher, transcribe) read `exit_code` and
+    // `stderr_excerpt` only. yt-dlp writes audio to a file (stdout unused);
+    // whisper.cpp parses stderr for language. Plan B may surface `stdout` and
+    // `elapsed` for richer logging / metrics; until then they fire dead_code in
+    // the bin compilation since they're public lib fields not exercised by main.
+    #[allow(dead_code)]
     pub stdout: Vec<u8>,
     pub stderr_excerpt: String,
+    #[allow(dead_code)]
     pub elapsed: Duration,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Error)]
 pub enum RunError {
     #[error("failed to spawn `{tool}`: {source}")]
@@ -59,13 +61,10 @@ pub enum RunError {
     },
 }
 
-// Dead code allowed: consumed by T11 (YtDlpFetcher) and T12 (transcribe step).
-//
 // Plan A coarse mapping: Spawn (environmental, e.g. binary missing) and Io
 // (system pipe error) both map to NetworkError, which is semantically wrong.
 // Plan B's failure classification (RetryableKind / UnavailableReason) will
 // need to revisit this — see docs/FOLLOWUPS.md.
-#[allow(dead_code)]
 impl From<RunError> for FetchError {
     fn from(err: RunError) -> Self {
         match err {
@@ -80,9 +79,6 @@ impl From<RunError> for FetchError {
     }
 }
 
-// Dead code allowed: `run` and `ring_buffer_tail` are consumed by T11 (YtDlpFetcher)
-// and T12 (transcribe step).
-#[allow(dead_code)]
 #[tracing::instrument(level = "debug", skip(spec), fields(tool = spec.program))]
 pub async fn run(spec: CommandSpec<'_>) -> Result<CommandOutcome, RunError> {
     let started = std::time::Instant::now();
@@ -169,7 +165,6 @@ pub async fn run(spec: CommandSpec<'_>) -> Result<CommandOutcome, RunError> {
     }
 }
 
-#[allow(dead_code)]
 fn ring_buffer_tail(buf: &[u8], cap: usize) -> String {
     if cap == 0 || buf.is_empty() {
         return String::new();
