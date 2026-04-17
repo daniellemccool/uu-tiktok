@@ -637,3 +637,78 @@ Two small inconsistencies in `src/ingest.rs`:
 Both fine for Plan A's happy-path single-process loop; worth fixing when
 this code next gets touched.
 
+---
+
+## Pipeline hardcodes `fetcher` / `transcript_source` provenance regardless of which fetcher/transcriber actually ran
+
+**Found in:** T14 code quality review (opus).
+**Disposition:** Deferred to Plan B (multi-fetcher work makes this load-bearing).
+**Trigger to revisit:** Plan B introduces a second `VideoFetcher` impl beyond
+`YtDlpFetcher`, OR Plan B introduces a non-whisper.cpp transcriber, OR Plan B's
+failure-classification work needs to attribute failures to a specific
+fetcher/transcriber.
+
+`src/pipeline.rs::process_one` constructs both `TranscriptMetadata`
+(written to `{video_id}.json`) and `SuccessArtifacts` (written to the
+`videos` table via `mark_succeeded`) with literal strings:
+
+```rust
+fetcher: "ytdlp",
+transcript_source: "whisper.cpp",
+```
+
+These values are independent of which `&dyn VideoFetcher` or `Transcriber`
+is actually wired in. The `VideoFetcher` trait has no `name()` /
+`identifier()` method; the `Transcriber` type alias is an opaque boxed
+`Fn`. Today this manifests in the `pipeline_fakes` test: the DB row and
+the metadata both record `fetcher: "ytdlp"` for a run that used
+`FakeFetcher`. For Plan A's single real fetcher (YtDlpFetcher) and single
+real transcriber (whisper.cpp via the `transcribe` module) this is
+symbolic and harmless.
+
+**Plan B impact:** real if multiple fetchers coexist (e.g., a future
+`YtDlpFetcher` + a `ResearchApiFetcher`), or if the transcriber becomes
+swappable (Whisper API, Vosk, Hugging Face). Provenance becomes a lie at
+the row level, defeating the purpose of recording it.
+
+**Suggested resolution paths (when this surfaces):**
+
+1. Add a `fn name(&self) -> &'static str` to `VideoFetcher`; pass it
+   through `process_one` into both writes.
+2. Promote `Transcriber` from an opaque boxed Fn to a small trait with
+   `name()` and an async `transcribe()` method.
+3. Pass provenance strings through `ProcessOptions` so the bin owns the
+   labelling and tests can supply their own.
+
+Option 3 is the cheapest stopgap; option 1+2 is the structural fix.
+Decision belongs to Plan B's fetcher/transcriber design.
+
+---
+
+## `pipeline_fakes` test does not verify .json metadata content, only existence
+
+**Found in:** T14 code quality review (opus).
+**Disposition:** Coverage gap; bundle with the next edit to
+`tests/pipeline_fakes.rs` or with the multi-fetcher work that makes
+provenance load-bearing.
+**Trigger to revisit:** any change to `TranscriptMetadata` field set or
+serialization, or the hardcoded-provenance fix above.
+
+`tests/pipeline_fakes.rs` asserts `.txt` and `.json` files exist on
+disk but never reads or deserializes either. Fields most likely to
+regress silently — `fetcher`, `transcript_source`, `language_detected`,
+`transcribed_at` (RFC 3339 format) — are all unexamined. A regression
+that swapped two `&str` field bindings in `TranscriptMetadata`'s
+construction, or changed `Utc::now().to_rfc3339()` to a non-RFC format,
+would pass the current test. Combined with the hardcoded-provenance
+followup above, the .json deserialization is also where a fix-test for
+"provenance reflects the actual fetcher" would naturally land.
+
+**Suggested fix when next touching the test:** parse the .json with
+`serde_json::from_slice::<serde_json::Value>` and assert the relevant
+fields, including `transcribed_at` matching an RFC 3339 regex. While in
+the file, optionally also assert: (a) the staged `fake.wav` was
+removed after success (`!fake_wav.exists()`); (b) a re-run (or
+`max_videos: Some(2)` against one pending row) returns `claimed: 0`
+with no further side-effects.
+

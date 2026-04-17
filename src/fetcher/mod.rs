@@ -17,9 +17,9 @@ pub trait VideoFetcher: Send + Sync {
     async fn acquire(&self, video_id: &str, source_url: &str) -> Result<Acquisition, FetchError>;
 }
 
-// Cfg-gated test fixture per AD0005; consumed by T14's pipeline test
-// (tests/process_pipeline.rs or similar). Bin compilation also gets the
-// feature when --features test-helpers is enabled.
+// Cfg-gated test fixture per AD0005; consumed by tests/pipeline_fakes.rs.
+// Bin compilation also gets the feature when --features test-helpers is
+// enabled, hence the dead_code suppression.
 #[cfg(any(test, feature = "test-helpers"))]
 #[allow(dead_code)]
 pub struct FakeFetcher {
