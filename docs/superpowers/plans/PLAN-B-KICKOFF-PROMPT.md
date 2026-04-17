@@ -50,6 +50,16 @@ Plan A's process worked well (per RETRO.md). Inherit it for Plan B:
 - **AD0005 test-helpers feature** — every new integration test file gets `[[test]] required-features = ["test-helpers"]` in Cargo.toml.
 - **FOLLOWUPS discipline** — `docs/FOLLOWUPS.md` already exists; resolved entries get removed (git history retains them); new entries added during Plan B reviews.
 
+### Step 3a: Three meta-process improvements identified after Plan A — apply during this planning session
+
+Per `docs/superpowers/plans/2026-04-16-plan-a/RETRO.md`'s "Meta-process improvements" section, three Plan A pain points have explicit fixes for Plan B. The brainstorm in Step 2 must apply all three.
+
+1. **Capture coherence decisions during brainstorm, not retrospectively.** As we discuss Plan B's design, maintain a running list of decision-candidates — not only architectural choices but coherence-maintaining choices (path layout, error mapping, test discipline, naming conventions, branch hygiene). Capture each as an ADR draft via `adg add` BEFORE writing the per-task plan files. The Plan A failure mode was AD0001-3 backfilled retroactively after patterns emerged across multiple tasks; AD0004's branch-placement reversal happened because the placement rule wasn't recorded when first articulated. By the time Plan B's per-task files exist, the relevant ADRs should already exist alongside them.
+
+2. **Structure tasks for early MVP.** Plan A produced a runnable end-to-end thing only at T14/T15 (the last 13% of the work). The user couldn't critically evaluate the prototype until everything was done. For Plan B, structure the task list as small epics where Epic 1 produces a runnable thin-slice MVP the operator can use — even if rough. Subsequent epics harden it. Recommended Plan A re-imagining for reference: Epic 1 = `transcribe-one URL` hardcoded path (no DB, no ingest, no sharding); Epic 2 = state DB + claim/process loop; Epic 3 = DDP-JSON ingest; Epic 4 = polish (init, e2e, sharding, atomic writes). Apply the same "MVP first, harden second" shape to whatever Plan B's actual scope turns out to be.
+
+3. **Curated per-task ADR dispatch.** When dispatching implementer or reviewer subagents during Plan B, the orchestrator (you, the controller) should pre-select which ADRs are directly relevant to each task and tell the subagent to read THOSE plus the overview — not all of them. The orchestrator has the full context to curate; subagents shouldn't waste tokens scanning ADRs that don't apply. Lightweight form: dispatch prompts include an explicit "ADRs directly relevant: AD000X, AD000Y" line; the rest are listed under "background, available if needed." Heavier form (only if Plan B grows beyond ~12 ADRs): tag-based ADR query via `adg query --tags`. Start with the lightweight form; escalate only if cost-benefit demands.
+
 ### Step 4: Subagent dispatch model
 
 Per Plan A's RETRO.md:

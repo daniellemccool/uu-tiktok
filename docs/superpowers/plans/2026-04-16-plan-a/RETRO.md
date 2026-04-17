@@ -144,3 +144,42 @@ This was the run's strongest argument for "the controller should pre-read the br
 5. **DDP timestamp timezone is a real correctness gap.** Plan B's first time-window filter will hit it. Either empirically test (compare a known donor's wall-clock to parsed UTC) or document the assumption explicitly. Don't ship Plan B without resolving.
 
 6. **The walking skeleton is alive.** `cargo build` produces a real binary that runs `init → ingest → process` end-to-end. Operators can poke at it now to find what Plan B should prioritize.
+
+## Meta-process improvements identified after Plan A
+
+Three improvements to the planning + dispatch model itself, surfaced by stepping back from the execution mechanics. These should be tried in Plan B and become process ADRs if they prove out.
+
+### 1. Capture coherence decisions at design time, not retrospectively
+
+Plan A's first three ADRs (AD0001 plan-split, AD0002 dead-code strategy, AD0003 test discipline) were all backfilled retroactively after the patterns had emerged across multiple tasks. AD0004 (sharding) and the AD0004-branch-placement reversal happened because the placement rule wasn't recorded when the design was first discussed — only after AD0001/2/3 had landed on main did the user articulate "feature-derived ADRs ride with the feature." By then AD0004 was already on main as a misplaced precedent.
+
+Pattern: when working through the design at session start, the orchestrator should maintain a running list of decision-candidates as they surface — not just architectural decisions, but coherence-maintaining choices like path layout conventions, error handling philosophy, test discipline expectations, dead-code policies, branch hygiene, naming conventions. Capture them as ADRs immediately, before implementation diverges. The "design diagram" (or in Plan A's case, the 3347-line spec) loses fidelity once code starts diverging from intent. A contributor reading only the code can't reconstruct WHY; they can only see WHAT.
+
+The fix is structural: design sessions emit a stack of ADRs alongside the per-task plan files. The plan structure inherits the discipline rather than discovering it.
+
+### 2. Structure tasks for early MVP, not late MVP
+
+Plan A produced an end-to-end runnable thing only at T14/T15 — the last 13% of the work. The actual core value ("scrape one URL, run whisper, output a transcript") was deferred to the very end. Until then, every artifact was scaffolding the operator couldn't critically evaluate.
+
+A better task ordering would have produced a thin-slice MVP first:
+
+- **Epic 1 (3-4 tasks):** Hardcoded `cargo run -- transcribe-one https://...` that takes one URL, calls yt-dlp, calls whisper.cpp, prints the transcript. No database, no ingestion, no sharding. Operator can run this against real videos and form opinions immediately.
+- **Epic 2 (3-4 tasks):** Add the state DB and the claim/process loop. Now the prototype processes a list of URLs durably.
+- **Epic 3 (3-4 tasks):** Add the DDP-JSON ingest. Now the prototype consumes real donations end-to-end.
+- **Epic 4 (3-4 tasks):** Polish (init subcommand, e2e test, init-script, sharding, atomic writes).
+
+Same total work; very different operator-feedback timeline. The user could have run Epic 1's output against real DDP-extracted URLs and surfaced timezone/short-link/provenance/format concerns at week one rather than after the entire foundation was built.
+
+This is the "tracer bullet" / "thin slice" pattern from agile orthodoxy. It also reduces wasted work: foundation built before MVP often turns out to be the wrong shape once real usage starts.
+
+### 3. Curated per-task ADR dispatch, not "read all of them"
+
+Every Plan A implementer/reviewer dispatch told the agent to read ALL the existing ADRs. By T15 that was 8 ADRs per dispatch. Realistically, T13 had no relevance to AD0004 (sharding); T14 had heavy AD0002/0006/0007/0008 relevance but not much AD0001 (plan split). The orchestrator IS the one with full context to know which ADRs apply to each task; it should curate.
+
+Two operational forms:
+
+**Lightweight (start with this):** dispatch prompts include an explicit "ADRs directly relevant to this task" list (e.g., "AD0002 + AD0006; the rest are background"). Reviewer dispatches likewise — the spec reviewer needs to verify compliance against the directly-relevant ADRs; checking all 8 against every task is wasted scan.
+
+**Heavier (only if the lightweight version proves the cost-benefit):** a `docs/decisions/index.yaml` tag scheme (`tags: [bin-lib-asymmetry, error-handling, persistence, observability, ...]`) plus a small `adg query --tags X,Y` lookup, where each per-task brief declares the tags it touches and the dispatch reads only matching ADRs. More machinery, more risk of mis-tagging; only worth it if Plan B grows beyond ~12 ADRs.
+
+The cost in Plan A was real: by T15, opus reviews were spending material context budget on ADR scanning that produced no findings against irrelevant decisions. Plan B will accumulate more ADRs, making the curated approach increasingly valuable.
