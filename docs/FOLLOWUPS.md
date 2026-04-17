@@ -516,3 +516,42 @@ serial happy path:
    `source_url.to_string()` in the `args` vector. Land this when Plan C wires
    resolved URLs into the fetcher pipeline.
 
+---
+
+## `transcribe::transcribe` error mapping is inconsistent and lossy
+
+**Found in:** T12 code quality review (opus).
+**Disposition:** Deferred. Folds into Plan B's failure-classification work
+alongside the existing T6 / T11 entries.
+**Trigger to revisit:** Plan B's `RetryableKind` / `UnavailableReason` /
+`ClassifiedFailure` design.
+
+Three concerns in `src/transcribe.rs::transcribe`, none blocking for Plan A's
+serial happy path:
+
+1. **Inline `.map_err(|e| match e {...})` instead of `From<RunError> for TranscribeError`.**
+   T6 chose the `From` idiom for `FetchError` so fetcher code can use `?`
+   directly; T12 chose the inline match. Brief's intentional choice (no
+   `From<RunError> for TranscribeError` impl in `errors.rs`), but Plan B's
+   failure-classification work should harmonize on one idiom across both
+   error types.
+
+2. **`exit_code: -1` sentinel collapses non-Timeout RunError variants.**
+   `RunError::Spawn`, `RunError::Io`, and any Plan B additions all collapse
+   to `TranscribeError::Failed { exit_code: -1, stderr_excerpt: other.to_string() }`.
+   Same loss-of-signal already flagged for T6's `From<RunError> for FetchError`
+   and `status.code().unwrap_or(-1)`. Whisper-cli OOM (signal kill) and
+   missing whisper-cli binary become indistinguishable to a downstream
+   classifier.
+
+3. **`exit_code: 0` for post-success artifact-read failure is misleading.**
+   When `std::fs::read_to_string(&txt_path)` fails after a 0-exit
+   whisper-cli run, the error is built as
+   `TranscribeError::Failed { exit_code: 0, stderr_excerpt: "reading {path}: {io_err}" }`.
+   A downstream consumer reading `exit_code: 0` would conclude the tool
+   succeeded; the failure was actually in the artifact-reading step.
+   Parallel to T11's `wav_path.exists() == false → FetchError::ParseError`
+   mismatch. Plan B should introduce a dedicated variant
+   (e.g., `TranscribeError::ArtifactMissing` /
+   `TranscribeError::ArtifactUnreadable`).
+
