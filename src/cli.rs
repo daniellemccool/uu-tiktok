@@ -32,6 +32,10 @@ pub struct GlobalArgs {
 
     #[arg(long, value_enum, default_value_t = LogFormat::Human, env = "UU_TIKTOK_LOG_FORMAT")]
     pub log_format: LogFormat,
+
+    /// Path to the whisper.cpp model file. Overrides the profile default.
+    #[arg(long, env = "UU_TIKTOK_WHISPER_MODEL")]
+    pub whisper_model: Option<PathBuf>,
 }
 
 #[derive(Subcommand, Debug)]

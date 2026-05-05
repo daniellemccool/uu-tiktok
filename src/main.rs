@@ -18,7 +18,12 @@ async fn main() -> Result<()> {
     let cli = cli::Cli::parse();
     init_tracing(cli.global.log_format);
     let cfg = config::Config::from_args(&cli.global);
-    tracing::info!(profile = ?cfg.profile, state_db = ?cfg.state_db, "config resolved");
+    tracing::info!(
+        profile = ?cfg.profile,
+        state_db = ?cfg.state_db,
+        whisper_model_path = ?cfg.whisper_model_path,
+        "config resolved"
+    );
 
     match cli.command {
         cli::Command::Init => {

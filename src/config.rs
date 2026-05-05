@@ -28,7 +28,10 @@ impl Config {
                 state_db: args.state_db.clone(),
                 inbox: args.inbox.clone(),
                 transcripts: args.transcripts.clone(),
-                whisper_model_path: PathBuf::from("./models/ggml-tiny.en.bin"),
+                whisper_model_path: args
+                    .whisper_model
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from("./models/ggml-tiny.en.bin")),
                 whisper_use_gpu: false,
                 whisper_threads: num_cpus_safe(),
                 ytdlp_timeout: Duration::from_secs(300),
@@ -55,6 +58,7 @@ mod tests {
             inbox: PathBuf::from("/tmp/in"),
             transcripts: PathBuf::from("/tmp/out"),
             log_format: crate::cli::LogFormat::Human,
+            whisper_model: None,
         }
     }
 
@@ -73,5 +77,16 @@ mod tests {
         assert_eq!(cfg.inbox, PathBuf::from("/tmp/in"));
         assert_eq!(cfg.transcripts, PathBuf::from("/tmp/out"));
         assert_eq!(cfg.state_db, PathBuf::from("/tmp/test.sqlite"));
+    }
+
+    #[test]
+    fn whisper_model_override_takes_precedence_over_profile_default() {
+        let mut args = dev_args();
+        args.whisper_model = Some(PathBuf::from("/custom/ggml-small.bin"));
+        let cfg = Config::from_args(&args);
+        assert_eq!(
+            cfg.whisper_model_path,
+            PathBuf::from("/custom/ggml-small.bin")
+        );
     }
 }

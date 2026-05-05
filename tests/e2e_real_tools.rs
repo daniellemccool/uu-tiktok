@@ -4,9 +4,9 @@ use std::process::Command;
 use tempfile::TempDir;
 
 /// Real-network test: requires yt-dlp, ffmpeg, and whisper-cli on PATH, plus
-/// the tiny.en model at ./models/ggml-tiny.en.bin (relative to the project
-/// root). The model path is currently a Plan A dev-profile constant; override
-/// support is FOLLOWUPS-tracked.
+/// a whisper.cpp model file. Defaults to ./models/ggml-tiny.en.bin (the
+/// Dev-profile default); override with --whisper-model PATH or
+/// UU_TIKTOK_WHISPER_MODEL=PATH for a non-English model.
 ///
 /// Manual run from the project root:
 ///   ./scripts/fetch-tiny-model.sh   # one-time: download the tiny.en model

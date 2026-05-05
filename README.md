@@ -9,7 +9,6 @@ and state for downstream analysis. Single Rust binary, SQLite-backed.
 > Plan-A quirks when you test:
 > - `ingest --dry-run` is not yet implemented — it logs a note and runs a real ingest anyway.
 > - `process` exits with code **3** when it claimed zero videos — this is intentional, not a failure.
-> - `whisper_model_path` is a dev-profile constant (`./models/ggml-tiny.en.bin`); there is no flag or env var to override it yet.
 
 ## Quickstart
 
@@ -71,13 +70,14 @@ Override the e2e video URL with `UU_TIKTOK_E2E_URL=<url>`.
 
 All subcommands accept the global flags below (or their env equivalents).
 
-| Flag             | Env                     | Default              | Notes                        |
-|------------------|-------------------------|----------------------|------------------------------|
-| `--profile`      | `UU_TIKTOK_PROFILE`     | `dev`                | Only `dev` is wired.         |
-| `--state-db`     | `UU_TIKTOK_STATE_DB`    | `./state.sqlite`     |                              |
-| `--inbox`        | `UU_TIKTOK_INBOX`       | `./inbox`            | DDP JSONs read from here.    |
-| `--transcripts`  | `UU_TIKTOK_TRANSCRIPTS` | `./transcripts`      | Artifacts written here.      |
-| `--log-format`   | `UU_TIKTOK_LOG_FORMAT`  | `human`              | `human` or `json`.           |
+| Flag              | Env                        | Default                       | Notes                                                                |
+|-------------------|----------------------------|-------------------------------|----------------------------------------------------------------------|
+| `--profile`       | `UU_TIKTOK_PROFILE`        | `dev`                         | Only `dev` is wired.                                                 |
+| `--state-db`      | `UU_TIKTOK_STATE_DB`       | `./state.sqlite`              |                                                                      |
+| `--inbox`         | `UU_TIKTOK_INBOX`          | `./inbox`                     | DDP JSONs read from here.                                            |
+| `--transcripts`   | `UU_TIKTOK_TRANSCRIPTS`    | `./transcripts`               | Artifacts written here.                                              |
+| `--log-format`    | `UU_TIKTOK_LOG_FORMAT`     | `human`                       | `human` or `json`.                                                   |
+| `--whisper-model` | `UU_TIKTOK_WHISPER_MODEL`  | `./models/ggml-tiny.en.bin`   | Path to whisper.cpp model file. `tiny.en` is English-only; for non-English audio use a multilingual model (e.g. `ggml-small.bin`). |
 
 Log verbosity is controlled by `RUST_LOG` (e.g. `RUST_LOG=debug`).
 
