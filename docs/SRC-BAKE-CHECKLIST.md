@@ -150,7 +150,7 @@ Use it. Don't hand-edit `config.rs`.
 git clone <this repo> uu-tiktok && cd uu-tiktok
 cargo build --release
 mkdir -p inbox transcripts
-cp tests/fixtures/ddp/20260416_test/*.json inbox/
+cp tests/fixtures/ddp/news_orgs/*.json inbox/
 ./target/release/uu-tiktok init
 ./target/release/uu-tiktok ingest
 time ./target/release/uu-tiktok process --max-videos 1

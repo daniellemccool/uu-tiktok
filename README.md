@@ -43,7 +43,7 @@ Using the shipped DDP fixture:
 
 ```sh
 mkdir -p inbox
-cp tests/fixtures/ddp/20260416_test/*.json inbox/
+cp tests/fixtures/ddp/news_orgs/*.json inbox/
 
 cargo run -- init
 cargo run -- ingest
