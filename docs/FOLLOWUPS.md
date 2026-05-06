@@ -729,3 +729,39 @@ has no real caller outside its own unit test. Either delete it, or have
 `pipeline.rs` call it instead of re-doing the join inline. Bundles naturally
 with the `VideoId` newtype refactor that AD0004 anticipates.
 
+---
+
+## `--whisper-model` global flag rejected when placed after subcommand (missing `global = true`)
+
+**Found in:** SRC bake (2026-05-06). `UU_TIKTOK_WHISPER_MODEL=... process`
+works, and `--whisper-model X process ...` works, but
+`process ... --whisper-model X` fails with
+`error: unexpected argument '--whisper-model' found`.
+**Disposition:** Clap UX papercut; env-var bypass available; not blocking.
+**Trigger to revisit:** any operator pastes the flag after the subcommand
+and gets the puzzling clap error, or when next touching `src/cli.rs` for
+unrelated reasons.
+
+In `src/cli.rs`, the `whisper_model` field on `GlobalArgs` is declared
+without `global = true`. Clap therefore parses it strictly as a top-level
+argument that must precede the subcommand:
+
+```
+uu-tiktok --whisper-model PATH process     # works
+uu-tiktok process --whisper-model PATH     # rejected
+UU_TIKTOK_WHISPER_MODEL=PATH uu-tiktok process    # works (env var bypass)
+```
+
+The env var sidesteps this entirely and is the production deployment
+pattern, so this is not blocking. But the flag form is the more
+discoverable path for ad-hoc operator use, and clap's `global = true`
+attribute makes the flag work on either side of the subcommand without any
+other code change:
+
+```rust
+#[arg(long, env = "UU_TIKTOK_WHISPER_MODEL", global = true)]
+pub whisper_model: Option<PathBuf>,
+```
+
+Should land alongside any future change touching the same struct.
+
