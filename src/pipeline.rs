@@ -35,6 +35,11 @@ pub struct ProcessOptions {
     pub worker_id: String,
     pub transcripts_root: PathBuf,
     pub max_videos: Option<usize>,
+    /// Identifier of the whisper.cpp model in use (e.g., the model file's
+    /// basename like "ggml-small.bin"). Threaded into each transcript's
+    /// metadata sidecar for provenance. Computed once at process startup
+    /// from the configured model path; no per-video cost.
+    pub transcript_model: String,
     pub transcriber: Transcriber,
 }
 
@@ -54,6 +59,7 @@ struct TranscriptMetadata<'a> {
     transcribed_at: String,
     fetcher: &'a str,
     transcript_source: &'a str,
+    transcript_model: &'a str,
 }
 
 // `stats.failed += 1` is followed immediately by `return Err(e)` in Plan A's
@@ -148,6 +154,7 @@ async fn process_one(
         transcribed_at: Utc::now().to_rfc3339(),
         fetcher: "ytdlp",
         transcript_source: "whisper.cpp",
+        transcript_model: &opts.transcript_model,
     };
     let json_bytes =
         serde_json::to_vec_pretty(&metadata).context("serializing transcript metadata")?;

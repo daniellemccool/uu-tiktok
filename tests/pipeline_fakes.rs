@@ -27,6 +27,7 @@ async fn pipeline_processes_one_video_to_succeeded_with_fake_fetcher() {
         worker_id: "test-worker".into(),
         transcripts_root: tmp.path().join("transcripts"),
         max_videos: Some(1),
+        transcript_model: "ggml-test.bin".into(),
         // For Plan A we provide a `fake_transcribe` callback in tests.
         // The real `process` subcommand calls the actual transcribe module.
         transcriber: Box::new(|_path| {
@@ -57,4 +58,10 @@ async fn pipeline_processes_one_video_to_succeeded_with_fake_fetcher() {
     assert!(txt.exists(), "transcript file at {}", txt.display());
     let json = tmp.path().join("transcripts/89/7234567890123456789.json");
     assert!(json.exists(), "transcript metadata at {}", json.display());
+    let json_value: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&json).unwrap()).unwrap();
+    assert_eq!(
+        json_value["transcript_model"], "ggml-test.bin",
+        "transcript_model field should reflect the configured model"
+    );
 }

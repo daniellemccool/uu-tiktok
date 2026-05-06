@@ -78,11 +78,19 @@ async fn main() -> Result<()> {
             let use_gpu = cfg.whisper_use_gpu;
             let threads = cfg.whisper_threads;
             let timeout = cfg.transcribe_timeout;
+            // Compute the model identifier once at startup; threaded into every
+            // per-video metadata sidecar without per-video filesystem work.
+            let transcript_model = model_path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("unknown")
+                .to_string();
 
             let opts = pipeline::ProcessOptions {
                 worker_id: format!("{}-{}", hostname_or_default(), std::process::id()),
                 transcripts_root: cfg.transcripts.clone(),
                 max_videos,
+                transcript_model,
                 transcriber: Box::new(move |path| {
                     let opts = transcribe::TranscribeOptions {
                         model_path: model_path.clone(),
