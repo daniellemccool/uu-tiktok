@@ -113,6 +113,127 @@ fn parse_language(stderr: &str) -> Option<String> {
     None
 }
 
+// ============================================================================
+// Plan B Epic 1: TranscribeOutput types
+// ============================================================================
+//
+// Pass-through raw signals from whisper.cpp's C API via the whisper-rs binding.
+// See AD0010 (raw_signals schema), AD0016 (worker-thread invariants).
+//
+// These types are OWNED data: no references, no whisper-rs handles. They cross
+// the worker-thread boundary safely (AD0016 #1: owned data only).
+
+use serde::{Deserialize, Serialize};
+
+/// Owned output from a single whisper inference. Crosses the worker-thread
+/// boundary (AD0016). T10's artifact writer maps these fields across the
+/// artifact JSON: `text` and `model_id` land at the top level (alongside
+/// Plan A's existing metadata), while `language`, `lang_probs`, and `segments`
+/// are placed inside the `raw_signals` sub-object (AD0010). This struct is
+/// the worker-return type, not a 1:1 mirror of `raw_signals`.
+// AD0002: fields unused until T9+; suppress dead-code lint until then.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TranscribeOutput {
+    /// Concatenated text of all segments.
+    pub text: String,
+    /// Detected language as a single ISO code, e.g. "en" or "nl".
+    /// From whisper_full_lang_id() (free per inference).
+    pub language: String,
+    /// Per-language probability vector, ONLY when PerCallConfig::compute_lang_probs is true.
+    /// Costs one extra encoder pass per video (sharp-edges.md:13).
+    pub lang_probs: Option<Vec<(String, f32)>>,
+    /// Per-segment raw confidence signals.
+    pub segments: Vec<SegmentRaw>,
+    /// Model identifier, e.g. "ggml-large-v3-turbo-q5_0.bin".
+    /// Already captured by Plan A's metadata.
+    pub model_id: String,
+}
+
+/// Per-segment raw confidence signals from whisper.cpp.
+// AD0002: unused until T9+.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SegmentRaw {
+    /// whisper_full_get_segment_no_speech_prob(state, i)
+    pub no_speech_prob: f32,
+    /// Per-token confidence signals for this segment.
+    pub tokens: Vec<TokenRaw>,
+}
+
+/// Per-token confidence signals from whisper.cpp.
+// AD0002: unused until T9+.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TokenRaw {
+    /// whisper_full_get_token_p(state, i, j) — token probability in [0.0, 1.0]
+    pub p: f32,
+    /// Token log-probability (TokenData::plog from whisper-rs)
+    pub plog: f32,
+}
+
+#[cfg(test)]
+mod plan_b_tests {
+    use super::*;
+
+    fn sample_output() -> TranscribeOutput {
+        TranscribeOutput {
+            text: "Hello world".to_string(),
+            language: "en".to_string(),
+            lang_probs: None,
+            segments: vec![SegmentRaw {
+                no_speech_prob: 0.02,
+                tokens: vec![
+                    TokenRaw {
+                        p: 0.99,
+                        plog: -0.01,
+                    },
+                    TokenRaw {
+                        p: 0.95,
+                        plog: -0.05,
+                    },
+                ],
+            }],
+            model_id: "ggml-tiny.en.bin".to_string(),
+        }
+    }
+
+    #[test]
+    fn transcribe_output_round_trip() {
+        let before = sample_output();
+        let json = serde_json::to_string(&before).expect("serialize");
+        let after: TranscribeOutput = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn lang_probs_none_serializes_as_null() {
+        let output = sample_output();
+        let json = serde_json::to_value(&output).expect("serialize");
+        assert_eq!(json["lang_probs"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn lang_probs_some_serializes_as_array_of_pairs() {
+        let mut output = sample_output();
+        output.lang_probs = Some(vec![("en".to_string(), 0.93), ("nl".to_string(), 0.05)]);
+        let json = serde_json::to_value(&output).expect("serialize");
+        let arr = json["lang_probs"].as_array().expect("array");
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0][0], "en");
+        assert!((arr[0][1].as_f64().unwrap() - 0.93).abs() < 1e-6);
+    }
+
+    #[test]
+    fn empty_segments_round_trip() {
+        let mut output = sample_output();
+        output.segments = vec![];
+        let json = serde_json::to_string(&output).expect("serialize");
+        let after: TranscribeOutput = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(output, after);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

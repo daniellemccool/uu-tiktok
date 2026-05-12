@@ -797,6 +797,25 @@ ADR.
 
 ---
 
+## T9 extraction must reject non-finite f32 values from whisper-rs
+
+**Found in:** T4 (TranscribeOutput types) — codex-advisor code-quality review.
+**Disposition:** Forward-pointer for T9's implementer brief.
+**Trigger to revisit:** During T9 dispatch.
+
+When T9 extracts `p`, `plog`, and `no_speech_prob` from whisper-rs into
+`TokenRaw` / `SegmentRaw`, validate that the values are finite before
+constructing the output. `serde_json` will refuse to serialize `NaN`/`inf`,
+so a bad value would surface only at T10's artifact-write step and abort
+the inference for an unhelpful reason. Reject non-finite values at the
+extraction boundary with a typed `TranscribeError` variant (likely
+`TranscribeError::Bug` since whisper-rs returning NaN/inf would itself
+indicate a model-loading or audio-input pathology that shouldn't happen
+with the AD0014 input invariant). Include the offending value, segment
+index, and token index in the error for operator-readable diagnostics.
+
+---
+
 ## `decode_wav` trusts float-format WAV sample values
 
 **Found in:** T3 (WAV decoder) — codex-advisor code-quality review.
