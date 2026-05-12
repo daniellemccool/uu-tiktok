@@ -6,6 +6,9 @@
 //! - ffmpeg on PATH (yt-dlp's postprocessor — 16 kHz mono WAV per AD0014)
 //! - ./models/ggml-tiny.en.bin on disk (or UU_TIKTOK_WHISPER_MODEL=PATH)
 //! - clang/libclang installed (whisper-rs's whisper-rs-sys binds via bindgen)
+//! - cmake on PATH (whisper-rs's build script invokes it)
+//! - a working C/C++ toolchain (gcc or clang, plus libstdc++)
+//! - CUDA toolkit for `--features cuda` builds (A10-bake runbook covers details)
 //! - network egress to the TikTok CDN
 //!
 //! Run manually during the SRC A10 bake (Task 13):
@@ -87,9 +90,12 @@ fn end_to_end_one_known_url() {
         .into_iter()
         .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
         .collect();
-    assert!(
-        !json_paths.is_empty(),
-        "no .json transcript artifact produced"
+    assert_eq!(
+        json_paths.len(),
+        1,
+        "expected exactly one .json transcript artifact for a single-video run, got {}: {:?}",
+        json_paths.len(),
+        json_paths
     );
 
     let json_text = std::fs::read_to_string(&json_paths[0]).expect("read json artifact");
@@ -98,11 +104,21 @@ fn end_to_end_one_known_url() {
     // Provenance: trait name() values per T11 (no more hardcoded strings).
     assert_eq!(parsed["fetcher"], "ytdlp");
     assert_eq!(parsed["transcript_source"], "whisper-rs");
+    assert!(
+        !parsed["model"].as_str().unwrap_or("").is_empty(),
+        "model field should be a non-empty string (engine returns the model file basename)"
+    );
 
     // raw_signals: AD0010 contract.
     let rs = &parsed["raw_signals"];
     assert!(!rs.is_null(), "raw_signals must be present");
+    // Two assertions on schema_version:
+    //   1. Match the implementation constant (drift detector — if the const
+    //      changes, the test catches the desync between impl and bake).
+    //   2. Match the literal "1" (wire-contract lock — schema v1 must always
+    //      serialize as the string "1" regardless of what the const says).
     assert_eq!(rs["schema_version"], EXPECTED_RAW_SIGNALS_SCHEMA_VERSION);
+    assert_eq!(rs["schema_version"], "1");
     assert!(
         !rs["language"].as_str().unwrap_or("").is_empty(),
         "language must be a non-empty ISO code"
@@ -113,6 +129,7 @@ fn end_to_end_one_known_url() {
         !segments.is_empty(),
         "real audio should produce at least one segment"
     );
+    let mut total_tokens = 0_usize;
     for (i, seg) in segments.iter().enumerate() {
         let no_speech = seg["no_speech_prob"]
             .as_f64()
@@ -122,6 +139,7 @@ fn end_to_end_one_known_url() {
             "segment {i} no_speech_prob out of range: {no_speech}"
         );
         let tokens = seg["tokens"].as_array().expect("tokens array");
+        total_tokens += tokens.len();
         for (j, tok) in tokens.iter().enumerate() {
             let id = tok["id"].as_i64().expect("token id is integer");
             assert!(
@@ -144,6 +162,11 @@ fn end_to_end_one_known_url() {
             );
         }
     }
+    assert!(
+        total_tokens > 0,
+        "real audio should produce at least one token across all segments — got {} segments with 0 tokens total",
+        segments.len()
+    );
 }
 
 fn walkdir(root: &std::path::Path) -> Vec<PathBuf> {
