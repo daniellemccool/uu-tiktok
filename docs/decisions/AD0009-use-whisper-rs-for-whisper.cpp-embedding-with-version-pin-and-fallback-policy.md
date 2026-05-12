@@ -4,6 +4,9 @@ comments:
     - author: Danielle McCool
       comment: "1"
       date: "2026-05-12 13:05:36"
+    - author: Danielle McCool
+      comment: "2"
+      date: "2026-05-12 13:46:33"
 links:
     precedes: []
     succeeds: []
@@ -33,3 +36,4 @@ We decided for [Option 1](#option-1) because: The C API exposes everything we ne
 
 ## <a name="comments"></a> Comments
 <a name="comment-1"></a>1. (2026-05-12 13:05:36) Danielle McCool: marked decision as decided
+<a name="comment-2"></a>2. (2026-05-12 13:46:33) Danielle McCool: Pinned versions (recorded in T2 cargo-deps commit, 2026-05-12): whisper-rs crate version = =0.16.0; whisper.cpp tracked = v1.8.3 (commit 2eeeba56e9edd762b4b38467bab96c2517163158). Upgrade discipline: bump these together (both lines) when whisper-rs releases a new version; re-run the bake measurements and verify they still match prior numbers before merging the bump. Build prerequisite: whisper-rs-sys runs bindgen at build time which requires libclang (Arch: `clang` package); install before first build.
