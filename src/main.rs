@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 
+mod audio;
 mod canonical;
 mod cli;
 mod config;

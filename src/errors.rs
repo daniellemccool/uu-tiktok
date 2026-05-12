@@ -37,6 +37,23 @@ pub enum TranscribeError {
 
     #[error("whisper.cpp produced no transcript")]
     EmptyOutput,
+
+    // AD0002: Cancelled is constructed by T7's abort_callback path; suppress
+    // dead_code until then.
+    #[allow(dead_code)]
+    #[error("transcription cancelled (deadline elapsed or operator-initiated)")]
+    Cancelled,
+
+    #[error("transcription bug: {detail}")]
+    Bug { detail: String },
+}
+
+impl From<crate::audio::AudioDecodeError> for TranscribeError {
+    fn from(e: crate::audio::AudioDecodeError) -> Self {
+        TranscribeError::Bug {
+            detail: format!("audio decode failure (should be classified, not Bug, in Epic 3): {e}"),
+        }
+    }
 }
 
 #[cfg(test)]

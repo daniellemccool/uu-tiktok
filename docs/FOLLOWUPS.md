@@ -797,6 +797,57 @@ ADR.
 
 ---
 
+## WhisperEngine teardown can hang once T7 lands real inference
+
+**Found in:** T5 (engine shell) — codex-advisor code-quality review.
+**Disposition:** Epic 2 (graceful shutdown / state-machine work).
+**Trigger to revisit:** Epic 2 planning, before pipelined orchestrator lands.
+
+T5's teardown (drop sender → join handle) is correct for an idle worker.
+Once T7 adds `whisper_full_with_state` inside the worker loop, an in-flight
+request that's already been dequeued can take seconds-to-minutes to finish;
+`shutdown()`/`Drop` will block until the request completes OR its deadline
+fires. For Epic 1's fail-fast exit (process dies on transcribe failure;
+OS reclaims everything) this is acceptable. For Epic 2's graceful shutdown,
+add a shutdown signal path that flips the current request's `cancel` flag
+when teardown begins — then the worker observes cancel and exits via
+`TranscribeError::Cancelled` rather than blocking on inference.
+
+---
+
+## `From<AudioDecodeError> for TranscribeError` maps to Bug for Epic 1 fail-fast
+
+**Found in:** T5 (engine shell) — codex-advisor code-quality review.
+**Disposition:** Epic 3 (failure classification taxonomy).
+**Trigger to revisit:** Epic 3 task planning.
+
+Currently `From<AudioDecodeError>` produces `TranscribeError::Bug { detail }`
+because Epic 1 lacks a failure-classification taxonomy. codex's review of
+T5 noted that audio-decode failures (corrupt yt-dlp output, truncated WAVs,
+unsupported sample formats) are not Bug-class — they're retryable/terminal
+failures depending on cause. When Epic 3's classification ADR lands, add
+`TranscribeError::AudioDecode { source }` (or whichever name fits the
+taxonomy) and amend the `From` impl. The Epic 2 state-machine work should
+be aware that `Bug`-from-AudioDecode is a temporary classification.
+
+---
+
+## Worker-side closed-reply path silently swallows the error
+
+**Found in:** T5 (engine shell) — codex-advisor code-quality review.
+**Disposition:** Operational logging improvement; not blocking Epic 1.
+**Trigger to revisit:** When Epic 2 wires tracing context (per-video request IDs).
+
+T5's worker loop uses `let _ = req.reply.send(...)`, ignoring the case
+where the caller dropped the receiver before the worker replied. This is
+expected during caller-side cancellation (`CancelOnDrop` fires, future is
+dropped) but suspicious otherwise. Once Epic 2 adds request-scoped tracing
+context, replace the swallow with a `tracing::warn!` that includes the
+video_id / request_id and the elapsed wallclock — so an unexplained dropped
+caller is visible in logs.
+
+---
+
 ## T9 extraction must reject non-finite f32 values from whisper-rs
 
 **Found in:** T4 (TranscribeOutput types) — codex-advisor code-quality review.
