@@ -38,9 +38,11 @@ pub const EXPECTED_RAW_SIGNALS_SCHEMA_VERSION: &str = "1";
 /// non-pipeline code paths.
 ///
 /// The `model` field name replaces Plan A's `transcript_model` (Plan B
-/// design). `raw_signals` is `None` for legacy / Plan A construction sites
-/// and `Some(...)` for Plan B construction sites — `skip_serializing_if`
-/// keeps backward compatibility on the wire.
+/// design). `raw_signals` is `None` during the T10→T11 interim — pipeline.rs
+/// still constructs `TranscriptMetadata` via the Plan A adapter — and
+/// `Some(...)` once T11 rewrites the call site onto the embedded whisper-rs
+/// engine. `skip_serializing_if` omits the field on the wire while None so
+/// JSON shape stays clean across the bridge.
 // Pipeline.rs constructs this struct directly (T10) and T11 will replace
 // that call site with a Plan B path. Some fields are not read by any
 // production code yet — they are projected into JSON only — which is fine.
@@ -56,9 +58,9 @@ pub struct TranscriptMetadata {
     pub transcript_source: String,
     pub model: String,
 
-    /// Plan B Epic 1 addition (T10). `None` for legacy / Plan A construction
-    /// sites; `Some(...)` once T11 rewrites the call site to use the
-    /// embedded whisper-rs engine.
+    /// Plan B Epic 1 addition (T10). `None` during the T10→T11 interim
+    /// while pipeline.rs still uses the Plan A adapter; `Some(...)` once
+    /// T11 rewrites the call site to use the embedded whisper-rs engine.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw_signals: Option<RawSignals>,
 }
@@ -287,11 +289,12 @@ mod tests {
         let json: Value = serde_json::to_value(&meta).expect("serialize");
         // Outer `raw_signals: Option<RawSignals>` uses
         // `skip_serializing_if = "Option::is_none"`, so the field is absent
-        // (not null) on the wire when None — back-compat for Plan A rows.
+        // (not null) on the wire when None — keeps the JSON clean during
+        // the T10→T11 bridge window before T11 wires the engine output.
         let obj = json.as_object().expect("top-level is a JSON object");
         assert!(
             !obj.contains_key("raw_signals"),
-            "raw_signals key must be absent when None (Plan A back-compat)"
+            "raw_signals key must be absent when None (T10→T11 bridge window)"
         );
     }
 
