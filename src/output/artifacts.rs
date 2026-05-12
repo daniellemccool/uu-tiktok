@@ -38,15 +38,11 @@ pub const EXPECTED_RAW_SIGNALS_SCHEMA_VERSION: &str = "1";
 /// non-pipeline code paths.
 ///
 /// The `model` field name replaces Plan A's `transcript_model` (Plan B
-/// design). `raw_signals` is `None` during the T10→T11 interim — pipeline.rs
-/// still constructs `TranscriptMetadata` via the Plan A adapter — and
-/// `Some(...)` once T11 rewrites the call site onto the embedded whisper-rs
-/// engine. `skip_serializing_if` omits the field on the wire while None so
-/// JSON shape stays clean across the bridge.
-// Pipeline.rs constructs this struct directly (T10) and T11 will replace
-// that call site with a Plan B path. Some fields are not read by any
-// production code yet — they are projected into JSON only — which is fine.
-#[allow(dead_code)]
+/// design). `raw_signals` is `Some(...)` post-T11: pipeline.rs constructs it
+/// via `RawSignals::from_transcribe_output` on every successful video.
+/// `skip_serializing_if` is retained for forward compatibility — a future
+/// fetcher tier that yields a transcript without raw signals (e.g., a cached
+/// ReadyTranscript variant) would set this to None.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TranscriptMetadata {
     pub video_id: String,
@@ -68,9 +64,6 @@ pub struct TranscriptMetadata {
 /// Pass-through raw confidence signals from whisper.cpp's C API.
 /// See AD0010 for the schema contract; T9's `TranscribeOutput` is the
 /// source-of-truth domain type that this projection consumes.
-// Constructed by `RawSignals::from_transcribe_output` (T10) and the inline
-// test module. T11 will use it from pipeline.rs.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RawSignals {
     pub schema_version: String,
@@ -82,7 +75,6 @@ pub struct RawSignals {
     pub segments: Vec<RawSegment>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RawSegment {
     pub no_speech_prob: f32,
@@ -93,7 +85,6 @@ pub struct RawSegment {
 /// the projection round-trips `id` + `text` losslessly — downstream
 /// consumers need both to filter special tokens (`[BEG]`, `[END]`, `<|en|>`,
 /// etc.) per AD0010's pass-through rule.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RawToken {
     pub id: i32,
@@ -106,7 +97,6 @@ impl RawSignals {
     /// Project T9's `TranscribeOutput` domain type into the artifact-side
     /// schema. AD0016: the conversion lives on the artifact side so the
     /// transcribe module stays independent of the artifact module.
-    #[allow(dead_code)] // consumed by T11 once the pipeline call site lands
     pub fn from_transcribe_output(output: &crate::transcribe::TranscribeOutput) -> Self {
         RawSignals {
             schema_version: EXPECTED_RAW_SIGNALS_SCHEMA_VERSION.to_string(),

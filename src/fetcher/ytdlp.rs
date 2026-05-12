@@ -81,4 +81,8 @@ impl VideoFetcher for YtDlpFetcher {
 
         Ok(Acquisition::AudioFile(wav_path))
     }
+
+    fn name(&self) -> &'static str {
+        "ytdlp"
+    }
 }

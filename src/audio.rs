@@ -6,9 +6,6 @@ use std::path::Path;
 
 use thiserror::Error;
 
-// AD0002: `audio` module is only consumed by tests + lib until T11 wires it into
-// the binary's pipeline. Suppress dead_code under the bin target until then.
-#[allow(dead_code)]
 #[derive(Debug, Error)]
 pub enum AudioDecodeError {
     #[error("opening WAV file {path}: {source}")]
@@ -43,8 +40,6 @@ pub enum AudioDecodeError {
 ///
 /// Whisper.cpp's C API requires this exact format (api-and-pipeline.md:7).
 /// Rejects non-conforming inputs with the appropriate [`AudioDecodeError`] variant.
-// AD0002: unused under the bin target until T11.
-#[allow(dead_code)]
 pub fn decode_wav(path: &Path) -> Result<Vec<f32>, AudioDecodeError> {
     let path_str = path.display().to_string();
     let mut reader = hound::WavReader::open(path).map_err(|e| AudioDecodeError::Open {

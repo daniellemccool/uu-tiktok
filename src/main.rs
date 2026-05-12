@@ -75,36 +75,42 @@ async fn main() -> Result<()> {
             std::fs::create_dir_all(&work_dir).context("creating work dir")?;
 
             let fetcher = fetcher::ytdlp::YtDlpFetcher::new(&work_dir, cfg.ytdlp_timeout);
-            let model_path = cfg.whisper_model_path.clone();
-            let use_gpu = cfg.whisper_use_gpu;
-            let threads = cfg.whisper_threads;
-            let timeout = cfg.transcribe_timeout;
-            // Compute the model identifier once at startup; threaded into every
-            // per-video metadata sidecar without per-video filesystem work.
-            let transcript_model = model_path
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("unknown")
-                .to_string();
+
+            // Construct WhisperEngine once at the top of Process. Loads the
+            // model on the worker thread and blocks until init succeeds or
+            // fails (AD0016: model/state never leave the worker; the engine
+            // handle owns the worker JoinHandle). For Epic 1's single-GPU
+            // path, `gpu_device = 0`; `flash_attn` follows the cuda feature
+            // flag (on for CUDA builds, off for local CPU dev).
+            //
+            // The std::sync::mpsc rendezvous inside `WhisperEngine::new`
+            // blocks this executor thread until init reports back. That's
+            // acceptable here because Process is the startup path; we have
+            // not yet entered the per-video hot loop.
+            let engine_config = transcribe::EngineConfig {
+                model_path: cfg.whisper_model_path.clone(),
+                gpu_device: 0,
+                flash_attn: cfg!(feature = "cuda"),
+            };
+            let engine = transcribe::WhisperEngine::new(&engine_config)
+                .context("constructing WhisperEngine")?;
 
             let opts = pipeline::ProcessOptions {
                 worker_id: format!("{}-{}", hostname_or_default(), std::process::id()),
                 transcripts_root: cfg.transcripts.clone(),
                 max_videos,
-                transcript_model,
-                transcriber: Box::new(move |path| {
-                    let opts = transcribe::TranscribeOptions {
-                        model_path: model_path.clone(),
-                        use_gpu,
-                        threads,
-                        timeout,
-                    };
-                    let path = path.to_path_buf();
-                    Box::pin(async move { transcribe::transcribe(&path, &opts).await })
-                }),
+                compute_lang_probs: cfg.compute_lang_probs,
+                transcribe_timeout: cfg.transcribe_timeout,
             };
 
-            let stats = pipeline::run_serial(&mut store, &fetcher, opts).await?;
+            // Shut the engine down whether the serial loop succeeded or
+            // failed. Drop ordering: take the stats result, tear down the
+            // engine (joins the worker thread), THEN propagate any error.
+            // Without this, an early-return on a failed video would leave
+            // the worker thread parked in blocking_recv until process exit.
+            let stats_result = pipeline::run_serial(&mut store, &fetcher, &engine, opts).await;
+            engine.shutdown();
+            let stats = stats_result?;
             tracing::info!(
                 claimed = stats.claimed,
                 succeeded = stats.succeeded,

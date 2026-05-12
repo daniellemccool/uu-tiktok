@@ -15,6 +15,13 @@ pub enum Acquisition {
 #[async_trait]
 pub trait VideoFetcher: Send + Sync {
     async fn acquire(&self, video_id: &str, source_url: &str) -> Result<Acquisition, FetchError>;
+
+    /// Identifier of the fetcher implementation, recorded in
+    /// `TranscriptMetadata::fetcher` and `SuccessArtifacts::fetcher`.
+    /// Replaces Plan A's hardcoded "ytdlp" literal so multi-fetcher
+    /// provenance reflects the actual fetcher that ran (partial resolution
+    /// of FOLLOWUPS T14).
+    fn name(&self) -> &'static str;
 }
 
 // Cfg-gated test fixture per AD0005; consumed by tests/pipeline_fakes.rs.
@@ -38,6 +45,10 @@ impl VideoFetcher for FakeFetcher {
                 video_id
             ))),
         }
+    }
+
+    fn name(&self) -> &'static str {
+        "fake-fetcher"
     }
 }
 

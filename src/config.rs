@@ -13,15 +13,21 @@ pub struct Config {
     /// Path to the whisper.cpp model file. Plan A defaults to a tiny.en model
     /// that the operator places at this path before running `process`.
     pub whisper_model_path: PathBuf,
+
+    // Plan A leftovers — Plan B's `WhisperEngine` does not consume these
+    // (whisper-rs picks `n_threads = min(4, hw_concurrency)` itself, and the
+    // GPU choice is an `i32` device index passed via `EngineConfig`). They
+    // still have CLI/env plumbing and per-field tests in `config.rs::tests`;
+    // deletion is a separate cleanup sweep (likely Epic 2 alongside the
+    // state-machine work). Suppressing dead_code while they're plumbed but
+    // unread keeps the diff minimal.
+    #[allow(dead_code)]
     pub whisper_use_gpu: bool,
+    #[allow(dead_code)]
     pub whisper_threads: usize,
 
     pub ytdlp_timeout: Duration,
     pub transcribe_timeout: Duration,
-    // AD0002: T8 adds this field; wired into pipeline in T-pipeline when
-    // process_one constructs PerCallConfig from Config. Until then, suppress
-    // the dead_code warning.
-    #[allow(dead_code)]
     pub compute_lang_probs: bool,
 }
 

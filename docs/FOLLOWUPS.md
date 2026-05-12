@@ -639,78 +639,31 @@ this code next gets touched.
 
 ---
 
-## Pipeline hardcodes `fetcher` / `transcript_source` provenance regardless of which fetcher/transcriber actually ran
+## `pipeline_fakes` test gaps: `transcribed_at` RFC 3339, wav cleanup, re-run idempotence
 
-**Found in:** T14 code quality review (opus).
-**Disposition:** Deferred to Plan B (multi-fetcher work makes this load-bearing).
-**Trigger to revisit:** Plan B introduces a second `VideoFetcher` impl beyond
-`YtDlpFetcher`, OR Plan B introduces a non-whisper.cpp transcriber, OR Plan B's
-failure-classification work needs to attribute failures to a specific
-fetcher/transcriber.
-
-`src/pipeline.rs::process_one` constructs both `TranscriptMetadata`
-(written to `{video_id}.json`) and `SuccessArtifacts` (written to the
-`videos` table via `mark_succeeded`) with literal strings:
-
-```rust
-fetcher: "ytdlp",
-transcript_source: "whisper.cpp",
-```
-
-These values are independent of which `&dyn VideoFetcher` or `Transcriber`
-is actually wired in. The `VideoFetcher` trait has no `name()` /
-`identifier()` method; the `Transcriber` type alias is an opaque boxed
-`Fn`. Today this manifests in the `pipeline_fakes` test: the DB row and
-the metadata both record `fetcher: "ytdlp"` for a run that used
-`FakeFetcher`. For Plan A's single real fetcher (YtDlpFetcher) and single
-real transcriber (whisper.cpp via the `transcribe` module) this is
-symbolic and harmless.
-
-**Plan B impact:** real if multiple fetchers coexist (e.g., a future
-`YtDlpFetcher` + a `ResearchApiFetcher`), or if the transcriber becomes
-swappable (Whisper API, Vosk, Hugging Face). Provenance becomes a lie at
-the row level, defeating the purpose of recording it.
-
-**Suggested resolution paths (when this surfaces):**
-
-1. Add a `fn name(&self) -> &'static str` to `VideoFetcher`; pass it
-   through `process_one` into both writes.
-2. Promote `Transcriber` from an opaque boxed Fn to a small trait with
-   `name()` and an async `transcribe()` method.
-3. Pass provenance strings through `ProcessOptions` so the bin owns the
-   labelling and tests can supply their own.
-
-Option 3 is the cheapest stopgap; option 1+2 is the structural fix.
-Decision belongs to Plan B's fetcher/transcriber design.
-
----
-
-## `pipeline_fakes` test does not verify .json metadata content, only existence
-
-**Found in:** T14 code quality review (opus).
+**Found in:** T14 code quality review (opus); narrowed in T11 (Plan B Epic 1).
 **Disposition:** Coverage gap; bundle with the next edit to
-`tests/pipeline_fakes.rs` or with the multi-fetcher work that makes
-provenance load-bearing.
+`tests/pipeline_fakes.rs`.
 **Trigger to revisit:** any change to `TranscriptMetadata` field set or
-serialization, or the hardcoded-provenance fix above.
+serialization (especially the `transcribed_at` format), or the wav-cleanup
+ordering near `mark_succeeded`.
 
-`tests/pipeline_fakes.rs` asserts `.txt` and `.json` files exist on
-disk but never reads or deserializes either. Fields most likely to
-regress silently — `fetcher`, `transcript_source`, `language_detected`,
-`transcribed_at` (RFC 3339 format) — are all unexamined. A regression
-that swapped two `&str` field bindings in `TranscriptMetadata`'s
-construction, or changed `Utc::now().to_rfc3339()` to a non-RFC format,
-would pass the current test. Combined with the hardcoded-provenance
-followup above, the .json deserialization is also where a fix-test for
-"provenance reflects the actual fetcher" would naturally land.
+T11 now reads and deserializes the `.json` artifact and asserts `model`,
+`transcript_source`, `fetcher`, plus the full `raw_signals` projection
+(schema_version, language, segments, tokens). Three smaller gaps remain
+from the original T14 finding:
 
-**Suggested fix when next touching the test:** parse the .json with
-`serde_json::from_slice::<serde_json::Value>` and assert the relevant
-fields, including `transcribed_at` matching an RFC 3339 regex. While in
-the file, optionally also assert: (a) the staged `fake.wav` was
-removed after success (`!fake_wav.exists()`); (b) a re-run (or
-`max_videos: Some(2)` against one pending row) returns `claimed: 0`
-with no further side-effects.
+1. `transcribed_at` is not asserted to be RFC 3339; a regression that
+   changed `Utc::now().to_rfc3339()` to a non-RFC format would still pass.
+2. The staged `fake.wav` cleanup post-success (`!fake_wav.exists()`) is
+   not asserted; a regression that skipped `std::fs::remove_file` would
+   still pass.
+3. Re-run idempotence (`max_videos: Some(2)` against one pending row
+   returns `claimed: 1` on the second invocation, not 2) is not exercised.
+
+All three are one-liners to add. Bundle with the next edit to
+`tests/pipeline_fakes.rs` (likely Epic 2's state-machine work that grows
+the test surface).
 
 ---
 
@@ -1096,5 +1049,60 @@ indexed comments are anchored). Workaround for T2: manually restored
 comment-1's anchor in AD0009 before commit so the rendered body matches
 `index.yaml`'s comment list. If this pattern recurs in T3-T12, propose an
 upstream `adg` fix.
+
+---
+
+## `Config::whisper_use_gpu` and `Config::whisper_threads` are unused by Plan B's engine path
+
+**Found in:** T11 (pipeline integration) — Plan A leftovers.
+**Disposition:** Defer cleanup sweep to Epic 2.
+**Trigger to revisit:** Epic 2's state-machine and config rationalization work,
+OR any task that touches `Config::from_args` for unrelated reasons.
+
+Plan B's `WhisperEngine` does not consume `whisper_use_gpu` or `whisper_threads`:
+whisper-rs picks `n_threads = min(4, hw_concurrency)` itself (api-and-pipeline.md:51),
+and the GPU choice is an `i32` device index passed via `EngineConfig::gpu_device`
+(currently hardcoded to `0` in `main.rs::Process` per pre-correction 3 of T11).
+T11 left both fields in place because they have CLI/env plumbing and per-field
+unit tests in `src/config.rs::tests`; deletion is a separate cleanup sweep.
+
+Both fields carry `#[allow(dead_code)]` annotations pointing here. The cleanup
+sweep should:
+
+1. Delete `whisper_use_gpu` and `whisper_threads` from `Config`.
+2. Remove their `whisper_model_override_takes_precedence_over_profile_default`-
+   adjacent unit tests in `src/config.rs::tests` (the assertions that check
+   default values).
+3. If a future operator-facing config knob is needed for GPU device index or
+   threads, add a typed field (`gpu_device: i32`, `n_threads: Option<usize>`)
+   to `EngineConfig` and thread it from `Config` then.
+
+Epic 2 is the natural home — that's when the broader Plan A → Plan B
+state-machine and config rationalization lands.
+
+---
+
+## Wav cleanup-before-mark_succeeded ordering inverted in T11; documented in pipeline.rs
+
+**Found in:** T11 (pipeline integration).
+**Disposition:** Resolved in T11; followup is purely a future-reader signpost.
+**Trigger to revisit:** Epic 2's state-machine work, or any task that
+reorders `process_one`'s tail.
+
+Plan A's `pipeline::process_one` did `remove_file(wav) → mark_succeeded`
+in that order. If `mark_succeeded` failed (rare; SQLite write error), the
+wav was already gone — recovery had no audio to re-transcribe. T11
+reversed the order: `mark_succeeded → remove_file`. If `mark_succeeded`
+fails, the wav stays on disk and a future retry can pick it up.
+
+The inverted order trades one form of waste for another: if `remove_file`
+fails after `mark_succeeded`, the wav lingers (operator sweeps), but the
+DB and artifacts are durable. This is the strictly safer trade. The
+ordering is intentional and documented in `src/pipeline.rs::process_one`'s
+inline comments — not a regression to revert.
+
+Epic 2's state-machine work may revisit this when adding stale-claim
+recovery or retry: at that point, a typed "wav still on disk" signal
+might become useful for re-claiming a row.
 
 

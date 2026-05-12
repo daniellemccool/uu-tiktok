@@ -1,46 +1,26 @@
-use std::future::Future;
 use std::path::PathBuf;
-use std::pin::Pin;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
 
-use crate::errors::TranscribeError;
+use crate::audio;
 use crate::fetcher::{Acquisition, VideoFetcher};
-use crate::output::artifacts::TranscriptMetadata;
+use crate::output::artifacts::{RawSignals, TranscriptMetadata};
 use crate::output::{artifacts, shard};
 use crate::state::{Claim, Store, SuccessArtifacts};
-use crate::transcribe::TranscribeResult;
-
-/// Test-injectable transcriber. Returns a boxed Future so the pipeline can
-/// `.await` it from within the async runtime — calling a blocking
-/// `tokio::runtime::Handle::block_on` from within an async context panics with
-/// "Cannot start a runtime from within a runtime." Tests pass a closure that
-/// returns `Box::pin(async { ... })`; production wires this to
-/// `transcribe::transcribe(...)` in `src/main.rs`.
-// Nested `Box<dyn Fn(...) -> Pin<Box<dyn Future<...> + Send>> + Send + Sync>`
-// trips clippy::type_complexity. The shape is the standard Rust idiom for an
-// injectable async callback, so suppress here rather than restructuring.
-#[allow(clippy::type_complexity)]
-pub type Transcriber = Box<
-    dyn Fn(
-            &std::path::Path,
-        )
-            -> Pin<Box<dyn Future<Output = Result<TranscribeResult, TranscribeError>> + Send>>
-        + Send
-        + Sync,
->;
+use crate::transcribe::{PerCallConfig, Transcriber};
 
 pub struct ProcessOptions {
     pub worker_id: String,
     pub transcripts_root: PathBuf,
     pub max_videos: Option<usize>,
-    /// Identifier of the whisper.cpp model in use (e.g., the model file's
-    /// basename like "ggml-small.bin"). Threaded into each transcript's
-    /// metadata sidecar for provenance. Computed once at process startup
-    /// from the configured model path; no per-video cost.
-    pub transcript_model: String,
-    pub transcriber: Transcriber,
+    /// Threaded from `Config::compute_lang_probs`. Consumed in `process_one`
+    /// when constructing `PerCallConfig`.
+    pub compute_lang_probs: bool,
+    /// Threaded from `Config::transcribe_timeout`. Per-call deadline handed
+    /// to `Transcriber::transcribe`; AD0012's abort_callback polls it.
+    pub transcribe_timeout: Duration,
 }
 
 #[derive(Debug, Default)]
@@ -49,13 +29,6 @@ pub struct ProcessStats {
     pub succeeded: usize,
     pub failed: usize,
 }
-
-// T10 lifted the (formerly private, borrowed-string) `TranscriptMetadata`
-// struct to `src/output/artifacts.rs` with owned `String` fields and the new
-// optional `raw_signals` field per AD0010. The construction site below
-// clones strings to satisfy the owned shape — T11 will rewrite this entire
-// block when wiring the Plan B engine, so the extra allocations are
-// transient and not worth optimizing here.
 
 // `stats.failed += 1` is followed immediately by `return Err(e)` in Plan A's
 // fail-fast behavior, so the increment is dead under -D warnings. Plan B will
@@ -66,6 +39,7 @@ pub struct ProcessStats {
 pub async fn run_serial(
     store: &mut Store,
     fetcher: &dyn VideoFetcher,
+    transcriber: &dyn Transcriber,
     opts: ProcessOptions,
 ) -> Result<ProcessStats> {
     let mut stats = ProcessStats::default();
@@ -78,7 +52,7 @@ pub async fn run_serial(
         };
         stats.claimed += 1;
 
-        match process_one(store, fetcher, &claim, &opts).await {
+        match process_one(store, fetcher, transcriber, &claim, &opts).await {
             Ok(()) => stats.succeeded += 1,
             Err(e) => {
                 stats.failed += 1;
@@ -100,6 +74,7 @@ pub async fn run_serial(
 async fn process_one(
     store: &mut Store,
     fetcher: &dyn VideoFetcher,
+    transcriber: &dyn Transcriber,
     claim: &Claim,
     opts: &ProcessOptions,
 ) -> Result<()> {
@@ -123,13 +98,29 @@ async fn process_one(
     };
     tracing::info!(video_id = claim.video_id.as_str(), wav = %wav_path.display(), "audio acquired");
 
-    let transcript = (opts.transcriber)(&wav_path)
+    // Decode WAV → owned Vec<f32> samples (AD0014: 16 kHz mono validated
+    // inside decode_wav). Owned samples cross the worker-thread boundary
+    // per AD0016. Compute duration_s from sample count once (16 kHz is the
+    // AD0014 invariant); avoids a second pass via ffprobe.
+    let samples = audio::decode_wav(&wav_path)
+        .with_context(|| format!("decoding wav {}", wav_path.display()))?;
+    let duration_s = Some(samples.len() as f64 / 16_000.0);
+
+    // Epic 1 stays auto-detect-only (PerCallConfig::default().language == None).
+    // No CLI flag for language pin; if Epic 4 needs one, it adds it then.
+    let per_call = PerCallConfig {
+        compute_lang_probs: opts.compute_lang_probs,
+        ..PerCallConfig::default()
+    };
+
+    let transcribe_output = transcriber
+        .transcribe(samples, per_call, opts.transcribe_timeout)
         .await
         .with_context(|| format!("transcribing {}", claim.video_id))?;
     tracing::info!(
         video_id = claim.video_id.as_str(),
-        chars = transcript.text.len(),
-        language = transcript.language.as_deref().unwrap_or("?"),
+        chars = transcribe_output.text.len(),
+        language = transcribe_output.language.as_str(),
         "transcribed"
     );
 
@@ -137,44 +128,50 @@ async fn process_one(
     std::fs::create_dir_all(&shard_dir)
         .with_context(|| format!("creating shard dir {}", shard_dir.display()))?;
 
+    // AD0008: artifact write (txt + json) before mark_succeeded. Two
+    // atomic_write calls: text first, JSON second. If a crash happens
+    // between the two, recovery sees a complete txt but missing json
+    // metadata — preferable to the reverse (operator-facing transcript
+    // missing while the DB claims success).
     let txt_path = shard_dir.join(format!("{}.txt", claim.video_id));
-    artifacts::atomic_write(&txt_path, transcript.text.as_bytes())
+    artifacts::atomic_write(&txt_path, transcribe_output.text.as_bytes())
         .with_context(|| format!("writing transcript {}", txt_path.display()))?;
 
     let metadata = TranscriptMetadata {
         video_id: claim.video_id.clone(),
         source_url: claim.source_url.clone(),
-        duration_s: transcript.duration_s,
-        language_detected: transcript.language.clone(),
+        duration_s,
+        language_detected: Some(transcribe_output.language.clone()),
         transcribed_at: Utc::now().to_rfc3339(),
-        fetcher: "ytdlp".to_string(),
-        transcript_source: "whisper.cpp".to_string(),
-        model: opts.transcript_model.clone(),
-        // T11 will populate this from the Plan B engine's TranscribeOutput
-        // via `RawSignals::from_transcribe_output`. Plan A's TranscribeResult
-        // (whisper-cli) does not carry raw signals — None here serializes to
-        // an absent field on the wire (`skip_serializing_if`).
-        raw_signals: None,
+        fetcher: fetcher.name().to_string(),
+        transcript_source: transcriber.name().to_string(),
+        model: transcribe_output.model_id.clone(),
+        raw_signals: Some(RawSignals::from_transcribe_output(&transcribe_output)),
     };
     let json_bytes =
         serde_json::to_vec_pretty(&metadata).context("serializing transcript metadata")?;
     let json_path = shard_dir.join(format!("{}.json", claim.video_id));
     artifacts::atomic_write(&json_path, &json_bytes)?;
 
-    // Cleanup the wav file once durably committed.
-    if let Err(e) = std::fs::remove_file(&wav_path) {
-        tracing::warn!(path = %wav_path.display(), error = %e, "could not remove wav after success");
-    }
-
+    // AD0008: artifacts durable, now mark the row succeeded.
     store.mark_succeeded(
         &claim.video_id,
         SuccessArtifacts {
-            duration_s: transcript.duration_s,
-            language_detected: transcript.language,
-            fetcher: "ytdlp",
-            transcript_source: "whisper.cpp",
+            duration_s,
+            language_detected: Some(transcribe_output.language.clone()),
+            fetcher: fetcher.name(),
+            transcript_source: transcriber.name(),
         },
     )?;
+
+    // Cleanup the wav file after the DB commit. If this fails, the success
+    // is already durable; the leftover wav is just disk churn an operator
+    // can sweep. (Plan A removed the wav before mark_succeeded, which left
+    // a window where a crashed mark_succeeded had no audio to retry from.
+    // Reversed here.)
+    if let Err(e) = std::fs::remove_file(&wav_path) {
+        tracing::warn!(path = %wav_path.display(), error = %e, "could not remove wav after success");
+    }
 
     tracing::info!(video_id = claim.video_id.as_str(), "succeeded");
     Ok(())
