@@ -1043,6 +1043,44 @@ index, and token index in the error for operator-readable diagnostics.
 
 ---
 
+## Per-token `id` + `text` roughly doubles JSON artifact size vs `{p, plog}` only
+
+**Found in:** T10 (artifact schema freeze) — implementer note.
+**Disposition:** Accepted for Plan B Epic 1; revisit when storage cost becomes
+load-bearing.
+**Trigger to revisit:** Plan C reviews artifact storage layout, OR observed
+shard-disk pressure during the A10 bake (T13), OR the artifact-storage cost
+becomes a discussion topic in any capacity (donor count > pilot scale,
+retention policy debate, etc.).
+
+T10's `RawToken` carries `id: i32` and `text: String` in addition to
+`p`/`plog`, matching T9's `TokenRaw` shape exactly. This is intentional per
+AD0010's pass-through rule — downstream consumers need both fields to
+filter special tokens (`[BEG]`, `[END]`, `<|en|>`, etc.) which numerically
+include but lexically distinguish themselves from content tokens. The cost
+is a roughly 2× growth in per-video JSON size compared to the `{p, plog}`-
+only sketch in the original T10 brief.
+
+At pilot scale (~10³ videos) this is irrelevant. Once the project hits
+~10⁵–10⁶ videos (or shards a single donor's history that spans years), the
+storage line item starts to matter. Two reasonable mitigations when this
+surfaces:
+
+1. **Streaming JSON gzip at the artifact-write boundary.** `atomic_write`
+   currently writes raw bytes; wrap with `flate2::write::GzEncoder` and
+   change the `.json` suffix to `.json.gz`. ~5–10× compression on token-
+   heavy JSON in typical measurements.
+2. **Sparse-token mode** — emit `id`+`text` only for tokens flagged as
+   special (low `p` or matching the model's special-token id range), and
+   the dense numeric pair `{p, plog}` for content tokens. Requires a
+   schema_version bump (`"1.1"` or `"2"`); covered by AD0010 comment-2's
+   string-versioning rationale.
+
+Option 1 is cheaper structurally; option 2 keeps the wire format inspectable.
+Don't pre-optimize — wait for the storage line item to actually pinch.
+
+---
+
 ## `adg comment` rewrites the rendered Comments section with only the latest entry
 
 **Found in:** T2 (cargo-deps amendment to AD0009 via `adg comment`).

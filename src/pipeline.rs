@@ -4,10 +4,10 @@ use std::pin::Pin;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use serde::Serialize;
 
 use crate::errors::TranscribeError;
 use crate::fetcher::{Acquisition, VideoFetcher};
+use crate::output::artifacts::TranscriptMetadata;
 use crate::output::{artifacts, shard};
 use crate::state::{Claim, Store, SuccessArtifacts};
 use crate::transcribe::TranscribeResult;
@@ -50,17 +50,12 @@ pub struct ProcessStats {
     pub failed: usize,
 }
 
-#[derive(Serialize)]
-struct TranscriptMetadata<'a> {
-    video_id: &'a str,
-    source_url: &'a str,
-    duration_s: Option<f64>,
-    language_detected: Option<&'a str>,
-    transcribed_at: String,
-    fetcher: &'a str,
-    transcript_source: &'a str,
-    transcript_model: &'a str,
-}
+// T10 lifted the (formerly private, borrowed-string) `TranscriptMetadata`
+// struct to `src/output/artifacts.rs` with owned `String` fields and the new
+// optional `raw_signals` field per AD0010. The construction site below
+// clones strings to satisfy the owned shape — T11 will rewrite this entire
+// block when wiring the Plan B engine, so the extra allocations are
+// transient and not worth optimizing here.
 
 // `stats.failed += 1` is followed immediately by `return Err(e)` in Plan A's
 // fail-fast behavior, so the increment is dead under -D warnings. Plan B will
@@ -147,14 +142,19 @@ async fn process_one(
         .with_context(|| format!("writing transcript {}", txt_path.display()))?;
 
     let metadata = TranscriptMetadata {
-        video_id: &claim.video_id,
-        source_url: &claim.source_url,
+        video_id: claim.video_id.clone(),
+        source_url: claim.source_url.clone(),
         duration_s: transcript.duration_s,
-        language_detected: transcript.language.as_deref(),
+        language_detected: transcript.language.clone(),
         transcribed_at: Utc::now().to_rfc3339(),
-        fetcher: "ytdlp",
-        transcript_source: "whisper.cpp",
-        transcript_model: &opts.transcript_model,
+        fetcher: "ytdlp".to_string(),
+        transcript_source: "whisper.cpp".to_string(),
+        model: opts.transcript_model.clone(),
+        // T11 will populate this from the Plan B engine's TranscribeOutput
+        // via `RawSignals::from_transcribe_output`. Plan A's TranscribeResult
+        // (whisper-cli) does not carry raw signals — None here serializes to
+        // an absent field on the wire (`skip_serializing_if`).
+        raw_signals: None,
     };
     let json_bytes =
         serde_json::to_vec_pretty(&metadata).context("serializing transcript metadata")?;

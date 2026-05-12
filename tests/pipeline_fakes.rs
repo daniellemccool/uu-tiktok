@@ -61,7 +61,8 @@ async fn pipeline_processes_one_video_to_succeeded_with_fake_fetcher() {
     let json_value: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&json).unwrap()).unwrap();
     assert_eq!(
-        json_value["transcript_model"], "ggml-test.bin",
-        "transcript_model field should reflect the configured model"
+        json_value["model"], "ggml-test.bin",
+        "model field should reflect the configured model (T10 rename: \
+         transcript_model → model on the lifted TranscriptMetadata struct)"
     );
 }
