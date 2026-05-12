@@ -131,8 +131,6 @@ use serde::{Deserialize, Serialize};
 /// Plan A's existing metadata), while `language`, `lang_probs`, and `segments`
 /// are placed inside the `raw_signals` sub-object (AD0010). This struct is
 /// the worker-return type, not a 1:1 mirror of `raw_signals`.
-// AD0002: fields unused until T9+; suppress dead-code lint until then.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TranscribeOutput {
     /// Concatenated text of all segments.
@@ -258,7 +256,7 @@ use std::thread;
 use std::time::Instant;
 
 use tokio::sync::{mpsc, oneshot};
-use whisper_rs::{WhisperContext, WhisperContextParameters};
+use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
@@ -267,21 +265,18 @@ pub struct EngineConfig {
     pub flash_attn: bool,
 }
 
-// AD0002: shell types are unused until T6/T7 wire them in.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 pub struct PerCallConfig {
     /// Some("en") to pin; None for auto-detect.
     pub language: Option<String>,
     /// If true, an extra encoder pass populates TranscribeOutput::lang_probs.
     /// See sharp-edges.md:13 — calling lang_detect re-encodes the audio.
+    // AD0002: T8 wires the opt-in `--compute-lang-probs` path; until then the
+    // field is constructed (Default) but never read by the worker.
+    #[allow(dead_code)]
     pub compute_lang_probs: bool,
 }
 
-// AD0002: shell type — most fields read inside the worker once T7 lands.
-// `samples`, `cancel`, `deadline` and `config` are written here in T6 but the
-// worker still ignores them; T7 wires them into whisper.cpp's parameters.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) struct TranscribeRequest {
     pub samples: Vec<f32>,
@@ -308,8 +303,21 @@ pub enum WhisperInitError {
     )]
     BackendMismatch,
 
+    #[error("creating whisper state: {detail}")]
+    StateCreate { detail: String },
+
     #[error("spawning whisper worker thread: {detail}")]
     WorkerSpawn { detail: String },
+}
+
+/// FFI trampoline for whisper.cpp's abort_callback. `user_data` must be the
+/// raw pointer returned by `Box::into_raw(Box::new(closure))` where `closure`
+/// is `Box<dyn FnMut() -> bool>`. See the AD0003 deviation comment inside the
+/// worker loop for why we hand-roll this instead of using
+/// `FullParams::set_abort_callback_safe`.
+unsafe extern "C" fn abort_trampoline(user_data: *mut std::ffi::c_void) -> bool {
+    let cb = unsafe { &mut *(user_data as *mut Box<dyn FnMut() -> bool>) };
+    cb()
 }
 
 /// Drop guard that flips the per-request cancel flag when the caller's
@@ -335,8 +343,9 @@ impl Drop for CancelOnDrop {
 /// dropped after the join attempt, the worker would park forever in
 /// `blocking_recv` and the join would hang. (Brief code had this hazard;
 /// AD0003 deviation — see commit body.)
-// AD0002: still unused outside tests until T8 wires the engine into the
-// pipeline; tests cover the public surface.
+// AD0002: WhisperEngine is still unused outside the test-helpers-gated
+// integration tests until T-pipeline wires it into the orchestrator; the
+// public API is covered by `tests/whisper_engine_init.rs`.
 #[allow(dead_code)]
 pub struct WhisperEngine {
     request_tx: Option<mpsc::Sender<TranscribeRequest>>,
@@ -385,7 +394,7 @@ impl WhisperEngine {
                 // whisper-rs 0.16.0 accepts P: AsRef<Path>; pass the PathBuf directly.
                 // AD0003 deviation from brief sketch (brief did .to_str().unwrap_or("")).
                 let ctx_result = WhisperContext::new_with_params(&model_path, ctx_params);
-                let _ctx = match ctx_result {
+                let ctx = match ctx_result {
                     Ok(c) => {
                         tracing::info!(
                             gpu_device = gpu_device,
@@ -393,9 +402,6 @@ impl WhisperEngine {
                             model_path = %model_path.display(),
                             "WhisperEngine: model loaded"
                         );
-                        if init_tx.send(Ok(())).is_err() {
-                            return; // caller went away
-                        }
                         c
                     }
                     Err(e) => {
@@ -407,36 +413,171 @@ impl WhisperEngine {
                     }
                 };
 
-                // `_ctx` lives until this closure exits — keeps the model in
-                // memory for the worker's lifetime. AD0016: WhisperContext
-                // stays inside the worker thread; it never escapes.
+                // Allocate WhisperState ONCE in the init phase and reuse it for
+                // every request. Per whisper.cpp's concurrency model
+                // (see whisper-cpp deepdive concurrency.md + sharp-edges.md:21):
+                // WhisperState owns ~500MB-1GB of KV caches and compute
+                // buffers; allocating one per request would defeat Plan B's
+                // efficiency goal. `whisper_full_with_state` clears `result_all`
+                // on entry (sharp-edges.md:19), so state reuse across calls is
+                // safe. Epic 1 ships single-state; Plan C may allocate N states
+                // per context for intra-GPU parallelism (AD0016 architecture).
                 //
-                // T7 SHAPE (read before implementing):
-                //   Allocate the WhisperState ONCE here (after init_tx.send(Ok)
-                //   above, before the request loop below) and reuse it for every
-                //   request:
-                //
-                //       let mut state = _ctx.create_state().map_err(...)?;
-                //       while let Some(req) = request_rx.blocking_recv() {
-                //           let mut params = FullParams::new(SamplingStrategy::Greedy { ... });
-                //           // ... configure abort_callback to poll req.cancel + req.deadline ...
-                //           state.full(params, &req.samples) ...
-                //       }
-                //
-                //   Per whisper.cpp's concurrency model (one-context-many-states,
-                //   see whisper-cpp deepdive concurrency.md): WhisperState owns
-                //   ~500MB-1GB of KV caches and compute buffers. Allocating one
-                //   per request would defeat Plan B's efficiency goal. Epic 1
-                //   ships single-state; Plan C may allocate N states per context
-                //   for intra-GPU parallelism (AD0016 architecture).
+                // `ctx` and `state` live until this closure exits — keep the
+                // model in memory for the worker's lifetime. AD0016:
+                // WhisperContext and WhisperState stay inside the worker
+                // thread; they never escape.
+                let mut state = match ctx.create_state() {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let _ = init_tx.send(Err(WhisperInitError::StateCreate {
+                            detail: format!("{e}"),
+                        }));
+                        return;
+                    }
+                };
+
+                // Init success: model AND state both loaded.
+                if init_tx.send(Ok(())).is_err() {
+                    return; // caller went away
+                }
+
+                // model_id is derived from the path file_name once, outside the
+                // hot loop. AD0010: this lands in the artifact's top-level
+                // `model_id` field; T9/T10 thread it through.
+                let model_id = model_path
+                    .file_name()
+                    .and_then(|os| os.to_str())
+                    .unwrap_or("unknown")
+                    .to_string();
 
                 while let Some(req) = request_rx.blocking_recv() {
-                    // T7 placeholder: still Bug. T7 fills the inference body per
-                    // the SHAPE comment above (state allocated outside this loop).
-                    let _ = req.reply.send(Err(TranscribeError::Bug {
-                        detail: "WhisperEngine::transcribe not yet implemented (T6 init only)"
-                            .to_string(),
+                    // FullParams configuration — embedding hygiene defaults per
+                    // AD0013 + sharp-edges.md:66 (`print_progress = true` is the
+                    // upstream default).
+                    // SamplingStrategy::Greedy { best_of: 1 } — memory-conservative
+                    // choice for Epic 1's bake. Plan A's whisper-cli used the
+                    // default best_of=5; sharp-edges.md:35 notes "beam_size=5
+                    // takes ~7× the KV memory of greedy. Memory-bounded? Prefer
+                    // greedy with low best_of." Revisit after T13's bake numbers:
+                    // on A10 (24GB) memory pressure is unlikely to be the
+                    // binding constraint, and best_of=5 may give a quality
+                    // bump worth the throughput cost. Tracked in FOLLOWUPS.
+                    let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+                    params.set_print_progress(false);
+                    params.set_print_realtime(false);
+                    params.set_print_special(false);
+                    params.set_print_timestamps(false);
+
+                    // Language pin (auto-detect when None). For monolingual
+                    // checkpoints (e.g., tiny.en) whisper.cpp accepts "auto"
+                    // and falls back to "en" internally.
+                    let lang = req.config.language.as_deref().unwrap_or("auto");
+                    params.set_language(Some(lang));
+
+                    // Cooperative cancellation per AD0012 comment-2: the abort
+                    // callback polls BOTH `Instant::now() >= deadline` AND
+                    // `cancel.load()` — deadline covers per-call timeout,
+                    // cancel covers operator-initiated / future-drop.
+                    //
+                    // AD0003 deviation: whisper-rs 0.16.0's
+                    // `set_abort_callback_safe` has a type-mismatch bug — at
+                    // whisper_params.rs:645 it registers `trampoline::<F>`
+                    // while the user_data pointer is actually
+                    // `*mut Box<dyn FnMut() -> bool>` (whisper_params.rs:643);
+                    // compare to the correct `set_progress_callback_safe` at
+                    // whisper_params.rs:597 which uses
+                    // `trampoline::<Box<dyn FnMut(i32)>>`. Using the safe
+                    // wrapper produces spurious `true` returns from the
+                    // callback (encode aborts with -6 even on a 60s deadline).
+                    // Fall back to the raw `unsafe set_abort_callback` with a
+                    // manual trampoline, and reclaim the Box after `full`
+                    // returns to avoid leaking ~16 bytes per request.
+                    // `abort_fired` is set INSIDE the callback when the predicate
+                    // first returns true. Post-inference we attribute an Err to
+                    // Cancelled only when the callback actually fired — not
+                    // merely when the deadline happens to have elapsed by the
+                    // time state.full returns. (codex review of T7: without
+                    // this, a non-cancellation Err that returns just after the
+                    // deadline would be misclassified as Cancelled.)
+                    let abort_fired = Arc::new(AtomicBool::new(false));
+                    let abort_fired_for_cb = Arc::clone(&abort_fired);
+                    let cancel_for_abort = Arc::clone(&req.cancel);
+                    let deadline_for_abort = req.deadline;
+                    let abort_box: Box<Box<dyn FnMut() -> bool>> = Box::new(Box::new(move || {
+                        let should_abort = Instant::now() >= deadline_for_abort
+                            || cancel_for_abort.load(std::sync::atomic::Ordering::Relaxed);
+                        if should_abort {
+                            abort_fired_for_cb.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        should_abort
                     }));
+                    let abort_user_data = Box::into_raw(abort_box);
+                    unsafe {
+                        params.set_abort_callback(Some(abort_trampoline));
+                        params
+                            .set_abort_callback_user_data(abort_user_data as *mut std::ffi::c_void);
+                    }
+
+                    let run_result = state.full(params, &req.samples);
+
+                    // Reclaim the closure box now that whisper.cpp no longer
+                    // holds the pointer. Safety: we own this allocation
+                    // (created via Box::into_raw above); whisper.cpp's
+                    // abort_callback only runs synchronously inside
+                    // `state.full`, which has returned.
+                    let _ = unsafe { Box::from_raw(abort_user_data) };
+
+                    // Attribute the Err. abort_fired captures "did the callback
+                    // actually return true during inference?", which avoids the
+                    // race where Instant::now() crosses req.deadline after
+                    // state.full returned with an unrelated Err.
+                    let was_cancelled = abort_fired.load(std::sync::atomic::Ordering::Relaxed);
+
+                    match run_result {
+                        Err(_) if was_cancelled => {
+                            let _ = req.reply.send(Err(TranscribeError::Cancelled));
+                        }
+                        Err(e) => {
+                            let _ = req.reply.send(Err(TranscribeError::Bug {
+                                detail: format!("whisper_full failed: {e}"),
+                            }));
+                        }
+                        Ok(()) => {
+                            // Extract text. Raw signal extraction (segments +
+                            // tokens) lands in T9 — return empty `segments` here
+                            // so T9 can extend without restructuring.
+                            // AD0003 deviation note: whisper-rs 0.16.0 has no
+                            // `full_get_segment_text`; use `get_segment(i)` +
+                            // `WhisperSegment::to_str()` instead.
+                            let n_segments = state.full_n_segments();
+                            let mut text = String::new();
+                            for i in 0..n_segments {
+                                if let Some(seg) = state.get_segment(i) {
+                                    if let Ok(s) = seg.to_str() {
+                                        text.push_str(s);
+                                    }
+                                }
+                            }
+
+                            // Detected language. AD0003 deviation: the method
+                            // is `full_lang_id_from_state` (not `full_lang_id`)
+                            // and the helper is the standalone
+                            // `whisper_rs::get_lang_str`.
+                            let lang_id = state.full_lang_id_from_state();
+                            let language = whisper_rs::get_lang_str(lang_id)
+                                .unwrap_or("unknown")
+                                .to_string();
+
+                            let _ = req.reply.send(Ok(TranscribeOutput {
+                                text,
+                                language,
+                                lang_probs: None, // T8 wires the opt-in path
+                                segments: vec![], // T9 fills with raw signals
+                                model_id: model_id.clone(),
+                            }));
+                        }
+                    }
                 }
                 // Sender dropped → channel closed → orderly exit. Per AD0016
                 // comment-2, this is the shutdown-carve-out path (not Bug).
@@ -543,11 +684,15 @@ impl Drop for WhisperEngine {
 // the model, so `/dev/null` now correctly fails before construction returns,
 // making the T5 assertions unreachable. The replacements live in
 // `tests/whisper_engine_init.rs` (test-helpers gated, uses ggml-tiny.en.bin):
-//   - engine_loads_tiny_en_model_successfully → exercises load → transcribe
-//     returns Bug → shutdown teardown (the missing shutdown-timing micro-
-//     assertion is implicit: a teardown deadlock would hang the test harness).
+//   - engine_loads_tiny_en_model_successfully → exercises load → real
+//     transcribe (T7 returns Ok with text+language; 5s shutdown wallclock
+//     guard catches Drop-ordering regressions).
 //   - engine_rejects_missing_model_path → exercises the WhisperInitError
 //     path that T5's `/dev/null`-construct-then-Bug-on-transcribe could not.
+//   - transcribe_silence_returns_empty_or_short_text → exercises the
+//     fixture-decoded silence path end-to-end.
+//   - transcribe_respects_short_deadline → exercises abort_callback firing
+//     on deadline elapse.
 // See AD0003 deviation disclosure in the commit body.
 
 #[cfg(test)]

@@ -797,6 +797,53 @@ ADR.
 
 ---
 
+## Revisit SamplingStrategy::Greedy { best_of } after T13 bake
+
+**Found in:** T7 (engine transcribe) — codex-advisor code-quality review.
+**Disposition:** Bake-data dependent; not blocking Epic 1.
+**Trigger to revisit:** After T13 produces per-clip wallclock + quality numbers on the A10 workspace.
+
+T7 currently uses `SamplingStrategy::Greedy { best_of: 1 }` — memory-
+conservative per sharp-edges.md:35 ("beam_size=5 takes ~7× the KV memory
+of greedy"). Plan A's whisper-cli used the default best_of=5. On an A10
+(24GB) memory pressure is unlikely to be the binding constraint, and
+best_of=5 may give a meaningful quality bump worth the throughput cost.
+T13's bake should measure both settings on representative TikTok audio
+and pick the one that fits the project's quality/throughput budget. If
+best_of != 1 wins, add a `best_of: u8` field to PerCallConfig (or to
+EngineConfig if it's a session-level choice).
+
+---
+
+## T8 lang_probs needs a SECOND WhisperState allocated in init phase
+
+**Found in:** T7 (engine transcribe) — codex-advisor code-quality review.
+**Disposition:** Forward-pointer for T8 dispatch.
+**Trigger to revisit:** During T8 implementer dispatch.
+
+T8 implements `--compute-lang-probs` (per AD0010 + PerCallConfig). Per
+sharp-edges.md:13-15: `whisper_lang_auto_detect_with_state` re-encodes
+the audio AND clobbers `state->decoders[0]` + `state->logits`. So it
+MUST run on a separate WhisperState from the primary inference state —
+otherwise concurrent state corruption.
+
+T7's worker currently allocates ONE state in the init phase. T8 should:
+1. Allocate a SECOND state (e.g., `lang_state`) in the same init phase,
+   alongside the primary `state`. Surface allocation failure via
+   `WhisperInitError::StateCreate` (same variant as T7).
+2. When `req.config.compute_lang_probs` is true, call `lang_state.lang_detect(&samples)`
+   (or equivalent whisper-rs API) BEFORE the primary `state.full(...)` —
+   the lang_detect call populates `state.full_lang_probs()` (or whichever
+   getter returns the full distribution).
+3. Reuse `lang_state` across requests — like the primary state.
+4. If `compute_lang_probs` is false (default), skip the lang_detect call
+   entirely so the unused state is just held in memory (no extra encoder pass).
+
+Memory cost: ~500MB-1GB for the second state (per concurrency.md). On A10
+this is fine; on dev machine it doubles the working set during testing.
+
+---
+
 ## AD0013 backend assertion must be cfg(feature = "cuda")-gated
 
 **Found in:** T6 (engine init) — codex-advisor code-quality review.
