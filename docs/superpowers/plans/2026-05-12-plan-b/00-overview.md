@@ -80,6 +80,36 @@ The `cuda` feature is opt-in so local CPU builds still work. CI builds non-cuda 
 - **Run `cargo fmt` and `cargo clippy --all-targets -- -D warnings` before each commit.** If clippy fires, fix the lint or `#[allow]` it with a one-line justification comment.
 - **AD0003 deviation honesty.** Every brief deviation (clippy-driven cosmetic fixes, structural choices that diverge from verbatim brief) gets prominent disclosure in commit message bodies.
 
+## Review cycle (Plan B refinement — 3 tiers instead of Plan A's 2)
+
+Plan B adds codex-advisor as a third reviewer tier. Per the brainstorm session that produced this plan, codex-advisor's input on code-quality dimensions complements opus's intra-Anthropic reviews with a different model family. The three tiers, per dispatch:
+
+| Tier | Role | What it checks |
+|------|------|----------------|
+| **Opus implementer** | Writes the code per the task brief | TDD discipline; brief-verbatim implementation; ADR compliance; AD0003 deviation honesty in commits |
+| **Sonnet spec-compliance reviewer** | Mechanical "does this match the brief" check | Brief steps were followed verbatim modulo documented deviations; ADRs declared in the task brief are honored; AD0002 dead-code cleanup applied; clippy/fmt clean |
+| **codex-advisor code-quality reviewer** | Qualitative correctness review | Subtle correctness issues; cross-file consistency; race conditions; lifetime/Send/Sync hazards; perf footguns; testing gaps |
+
+**codex-advisor session continuity:** the pinned session from the brainstorm (UUID `019e1b70-1ea0-75b3-83ba-9a68f63d0545` as of plan write) maintains all the Plan B context already. Reuse it for code-quality reviews via `codex-advisor ask <prompt>` per task. If the session is lost or reset, re-init with the priming prompt at the top of the spec and `orient` on the Plan B design spec file.
+
+**Dispatch protocol per task:**
+
+1. Controller dispatches opus implementer with the task brief + curated ADRs (per RETRO meta-improvement #3)
+2. Implementer reports `DONE` (or `DONE_WITH_CONCERNS` / `BLOCKED`)
+3. Controller dispatches sonnet spec-compliance reviewer with: the brief, the diff, and the curated ADRs
+4. If sonnet flags issues: controller decides fix path (inline edit, re-dispatch implementer, or accept with AD0003 deviation note)
+5. Controller asks codex-advisor for code-quality review via `codex-advisor ask` with the diff and the task brief
+6. If codex-advisor flags genuine issues: controller decides fix path (same options as step 4)
+7. After all reviews resolve: commit (controller does the commit), update FOLLOWUPS if needed, move to next task
+
+**Cost-quality calibration** (from Plan A's RETRO refined for Plan B):
+
+- Opus for implementation when the task has multi-subtle interactions (Plan B's T6 engine init, T7 transcribe, T11 pipeline integration); sonnet for mechanically tractable tasks (T2, T3, T8, T12).
+- Sonnet is sufficient for spec-compliance review across the board — that work is mechanical.
+- codex-advisor is consulted per-task. For trivial tasks (T2 cargo deps) the review may be a one-line "looks fine"; for substantial tasks (T7, T11) expect specific findings.
+
+The single-flight Agent dispatch (thermal lock from Plan A) still applies.
+
 ---
 
 ## Architectural Decision Records (ADRs) — Epic 1

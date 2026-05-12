@@ -101,3 +101,47 @@ After Epic 5 ships, Plan B is done. Outputs:
 - FOLLOWUPS.md drained of Plan B–scope entries
 
 The next milestone (Plan C) is the production-grade work: API fetcher, comments, multi-GPU implementation, manifest export, short-link resolution.
+
+## Notes from the brainstorm session (codex-advisor + whisper-cpp skill)
+
+- **Bin/lib reassessment criteria** (AD0030 supersedes AD0002): the decision hinges on whether downstream library consumers exist. Plan B is a single-binary tool with no external library consumers. Option 4 (thin-binary-fat-library) is structurally cleaner but adds no value if no one imports `uu_tiktok` as a library. Conversely, the current dual-`mod` pattern works fine and `cargo clippy` doesn't complain. **Default recommendation: keep the dual-mod pattern**; revisit only if a real library consumer emerges (e.g., a separate `uu-tiktok-tools` crate that wants to reuse `Store`).
+- **`Store::conn_mut` is dead.** FOLLOWUPS confirms zero consumers. Delete it in Epic 5. `Store::conn` has one cfg(test) consumer; keep with comment "used by cfg(test) schema invariant tests."
+- **`output::shard_dir` is dead.** FOLLOWUPS confirms zero consumers. Delete in Epic 5.
+- **`videos.updated_at` semantics**: FOLLOWUPS T9 entry. Epic 5 decides between (a) renaming to `inserted_at`, or (b) switching `upsert_video` to `ON CONFLICT DO UPDATE SET updated_at = excluded.updated_at`. Option (b) is the right move if Epic 2's stale-claim sweep ends up consuming `updated_at` for anything; Option (a) is the right move if it doesn't. Defer the choice until Epic 2 is shipped and we know what consumed `updated_at`.
+- **`Store::pragma_string` visibility**: FOLLOWUPS entry recommends `pub(crate)`. Lower it unconditionally; the only caller is the cfg(test) integration test which can opt in via the `test-helpers` feature per AD0005.
+- **`ring_buffer_tail` rename**: bundle with Epic 2's bounded-buffer work (already noted in Epic 2 sketch). Epic 5 doesn't need to repeat.
+- **`From<RunError> for FetchError` mapping cleanup**: deferred from Epic 3's typed-error work into Epic 5 if Epic 3 didn't fully clean it. Verify after Epic 3 ships.
+- **The `--whisper-model` global flag fix** (FOLLOWUPS entry at end of file): one-line `global = true` on the clap argument. Trivial; do in Epic 5 alongside any clap surface touch.
+
+## FOLLOWUPS resolution map (Plan B-wide)
+
+Tracking which Plan B epic resolves which FOLLOWUPS entry. Plan B is "done" when every Plan-B-scope FOLLOWUPS entry is either deleted (resolved) or moved to "Plan C" with explicit rationale.
+
+| FOLLOWUPS entry | Plan B epic | Resolution |
+|---|---|---|
+| `process::run` unbounded stdout/stderr (T6) | Epic 2 | Bounded streaming capture |
+| `ring_buffer_tail` misnamed (T6) | Epic 2 | Rename alongside bounded-buffer work |
+| `From<RunError> for FetchError` collapses Spawn/Io (T6) | Epic 3 | Typed variants |
+| `status.code().unwrap_or(-1)` loses signal info (T6) | Epic 3 | Add `signal` field |
+| `Store::open` schema-version not read (T7) | Epic 2 first task | Read-and-check policy |
+| `Store::pragma_string` pub vs pub(crate) (T7) | Epic 5 | Lower to pub(crate) |
+| `Store::read_meta` OptionalExtension (T7) | Epic 5 | Refactor when touched |
+| `output::shard` ASCII-only byte slice (T8) | Plan C | When VideoId newtype lands |
+| `output::cleanup_tmp_files` polish (T8) | Epic 5 | Bundle with sync-IO sweep |
+| `output::shard_distributes_uniformly` rationale (T8) | Epic 5 | Refactor comment when touched |
+| `videos.updated_at` frozen by upsert_video (T9) | Epic 5 | Decision after Epic 2 ships |
+| `Store::conn`/`conn_mut` accessor hygiene (T9/T10) | Epic 5 | Delete conn_mut; refresh comment |
+| `concurrent_claim_serializes_via_begin_immediate` doesn't race (T10) | Epic 2 | Rewrite with Barrier |
+| `mark_succeeded` doesn't require status='in_progress' (T10) | Epic 2 | WHERE predicate |
+| `claim_next`/`mark_succeeded` lack `with_context` (T10) | Epic 3 | Bundle with error restructure |
+| `claim_next` polling semantics (T10) | Epic 2 | Explicit sleep/backoff policy |
+| Missing round-trip test: succeeded not re-claimable (T10) | Epic 2 | Add to state_claims tests |
+| `YtDlpFetcher::acquire` error mapping (T11) | Epic 3 | Classifier covers it |
+| `transcribe::transcribe` error mapping (T12) | Epic 1 (T11 deletes the function) | Resolved by Plan B Epic 1 |
+| `parse_watched_at` UTC assumption (T13) | Epic 4 | AD0027 resolution path |
+| `ingest::walk_recursive` polish (T13) | Epic 5 | Bundle with sync-IO sweep |
+| Pipeline hardcodes fetcher/transcript_source (T14) | Epic 1 (T11) | Resolved by Plan B Epic 1 |
+| `pipeline_fakes` test doesn't verify .json (T14) | Epic 1 (T11) | Resolved by Plan B Epic 1 |
+| `output::shard_dir` unused (T15) | Epic 5 | Delete |
+| `--whisper-model` global flag rejected after subcommand | Epic 5 | One-line `global = true` |
+| SHORT_LINK_RE query parameters | Plan C | Short-link resolution is Plan C |

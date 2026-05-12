@@ -70,3 +70,14 @@ docs/decisions/AD0018-...md         # six new ADRs
 - The Epic 1 bake numbers in `docs/SRC-BAKE-NOTES.md`. Tells us whether fetch-transcribe overlap actually buys throughput at our scale.
 - `docs/FOLLOWUPS.md` updated state — entries marked resolved by Epic 1 are deleted; new ones inform Epic 2 sub-tasks.
 - The Epic 1 `WhisperEngine` API surface — Epic 2 must keep the engine's public API stable while wrapping the orchestrator around it.
+
+## Notes from the brainstorm session (codex-advisor + whisper-cpp skill)
+
+Surfaced during Plan B design but not directly affecting Epic 1; flagging here so the Epic 2 planner doesn't rediscover them.
+
+- **`tokio::main` shape may need restructuring** to compose with the JoinSet supervision pattern. Plan A's `main.rs` uses `#[tokio::main]` and a serial loop; Epic 2's bounded mpsc + N download workers + JoinSet supervision may require a more explicit runtime construction or a `LocalSet`. The opus reviewer flagged this generically; verify against the actual Plan A `main.rs` shape before designing Epic 2's per-task expansion.
+- **FOLLOWUPS T10 concurrency test fix is structural, not cosmetic.** The current `concurrent_claim_serializes_via_begin_immediate` test creates two `Store` handles but invokes `claim_next` sequentially on the main thread. It never exercises real contention. Rewrite using `std::thread::spawn` + `std::sync::Barrier` so both threads enter `claim_next` simultaneously; assert exactly one returns `Some` and the other `None` (or that distinct video_ids are returned with multiple pending rows).
+- **Stale-claim recovery deliberately redoes work** per Plan B revision 3 (AD0008 maintained). The validate-and-mark-succeeded optimization codex-advisor suggested is Plan C scope; do NOT introduce it in Epic 2 even if the GPU rework cost looks painful. Document the choice in Epic 2's per-task ADR for stale-recovery semantics.
+- **Status WHERE-predicate** on `mark_succeeded`: explicit `WHERE status='in_progress' AND claimed_by = ?` returning `Result<usize>` per AD0006. Bake the gate into the convention for `mark_retryable_failure` and `mark_terminal_failure` from day one (the FOLLOWUPS T10 entry warned this would surface).
+- **Bounded `process::run` capture** uses a `VecDeque<u8>` ring buffer of size `stderr_capture_bytes` per the FOLLOWUPS T6 entry. The misnamed `ring_buffer_tail` function gets renamed alongside (FOLLOWUPS entry suggests `tail_excerpt` or `last_n_bytes_lossy`).
+- **Claim contention polling**: prefer sleep-between-empty-polls (e.g., 100ms backoff up to 2s) rather than rely on `busy_timeout=5000` blocking. Codex-advisor's second-pass flagged that hot polling without sleeps churns the SQLite write lock; an explicit polling strategy is cleaner than inherited PRAGMA behavior.
