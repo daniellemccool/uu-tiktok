@@ -1105,4 +1105,59 @@ Epic 2's state-machine work may revisit this when adding stale-claim
 recovery or retry: at that point, a typed "wav still on disk" signal
 might become useful for re-claiming a row.
 
+---
+
+## YtDlpFetcher's `-x` auto-format-selection picks phantom video-only TikTok streams
+
+**Found in:** T13 bake (per-model loop on `news_orgs` fixture, video #2 = `7571766274108181792` on `@rtl.nl`).
+**Disposition:** Deferred to Plan B Epic 3 (fetcher hardening alongside failure classification).
+**Trigger to revisit:** Epic 3 kickoff; OR sooner if any subsequent bake on a different fixture reproduces the same `ffprobe: unable to obtain file audio codec` failure.
+
+**Reproduction observed during bake:**
+
+1. `process --max-videos 5` fails at video #2 with `ERROR: Postprocessing: WARNING: unable to obtain file audio codec with ffprobe`.
+2. Manual reproduction: same yt-dlp invocation downloads `bytevc1_1080p_559269-1` — a format ID that does NOT appear in `yt-dlp --list-formats <url>` output (closest listed format is `bytevc1_1080p_583083-1`, different bitrate).
+3. `ffprobe -show_streams` on the downloaded MP4 shows ONLY `codec_type=video` (codec `hevc`); no audio stream present.
+4. `yt-dlp --list-formats` shows all visible formats have `acodec=aac` (combined video+audio). So yt-dlp's `--extract-audio` (`-x`) auto-select walked OFF the listed format menu and picked an internal DASH-style video-only segment.
+5. Explicit `-f "b"` (best combined) downloads the listed `bytevc1_1080p_583083-1` format and extracts a clean 4.4 MB WAV via ffmpeg. Confirmed fix.
+
+**The fix (one-line patch to `src/fetcher/ytdlp.rs`):** add `"-f", "ba/b"` (best audio-only OR best combined) to the yt-dlp argument list before the URL. Prefers audio-only when TikTok exposes a separate stream; falls back to best combined format when not. Robust against the auto-select walking off the listed format menu.
+
+**Why deferred, not fixed now:** Epic 3 owns the fetcher's full hardening sweep (typed error classification, default-cautious posture for unknown stderr, classifier rules for yt-dlp/ffmpeg patterns per spec § "Classification rules"). A one-line `-f "ba/b"` change here, dropped into Epic 1, would land outside that hardening pass and risk drifting from Epic 3's design. The current bake outcome (n=1 per model, all four models verified) does not require this fix; Plan B Epic 2's pipelined orchestrator will not require it either if Epic 2 introduces failure persistence (the rtl.nl video would just be marked `failed_retryable` and the loop would continue to subsequent videos).
+
+**Severity if left unfixed:** material at production scale. The Escobar/French video fetched fine; the rtl.nl video failed reproducibly. Failure rate at scale (1M-video production) is unknown until the patched fetcher is bake-tested on a representative URL sample. May correlate with TikTok account (newer-style DASH delivery vs older combined uploads).
+
+**Bake-notes cross-reference:** `docs/SRC-BAKE-NOTES.md` § "Plan B Epic 3 findings surfaced during bake" — Finding 1.
+
+---
+
+## `pipx inject yt-dlp curl-cffi` reports success but yt-dlp still cannot activate impersonation
+
+**Found in:** T13 bake (workspace-side fetcher hardening attempt).
+**Disposition:** Deferred to Plan B Epic 3 (or a focused mini-bake to determine whether impersonation is required at scale).
+**Trigger to revisit:** Epic 3 fetcher hardening; OR a focused mini-bake of N=20+ TikTok URLs from a representative donation sample, with and without working impersonation, to establish whether the impersonation gap actually affects fetch success rate.
+
+**Reproduction observed during bake:**
+
+1. `pipx inject yt-dlp curl-cffi 2>&1` reports `injected package curl-cffi into venv yt-dlp ✨ 🌟 ✨` — success on the pipx side.
+2. `yt-dlp --list-impersonate-targets` continues to show all targets (Chrome, Firefox, Edge, Safari, Tor) as `(unavailable)`.
+3. Every subsequent `yt-dlp` invocation still emits the warning: `The extractor is attempting impersonation, but no impersonate target is available. If you encounter errors, then see https://github.com/yt-dlp/yt-dlp#impersonation`.
+
+**Hypothesis (not confirmed during the bake — diagnostic curtailed for paste-friction reasons):**
+
+The injected curl-cffi C extension may have built without proper libcurl linkage. The diagnostic command `~/.local/share/pipx/venvs/yt-dlp/bin/python -c "from curl_cffi import requests; print('ok')"` was prepared but not run. If it fails with an OSError or ImportError about libcurl, the fix is likely:
+
+```sh
+sudo apt install -y libcurl4-openssl-dev
+pipx inject yt-dlp 'curl-cffi>=0.11' --force
+```
+
+before retrying `--list-impersonate-targets`.
+
+**Open question — whether impersonation is actually load-bearing:** Initial assumption during the bake ("TikTok IP-blocks SURF datacenter IPs") was withdrawn after the apparent block message turned out to be a URL typo on a manual probe. The single observed fetcher failure (rtl.nl video) was caused by yt-dlp's format-selection issue (separate FOLLOWUPS entry above), NOT by IP reputation or fingerprint blocking. Whether impersonation is needed to fetch the bulk of donation TikTok content from SURF workspaces reliably is unknown. A focused mini-bake of N=20+ URLs from a representative sample, with and without working impersonation, would settle the question.
+
+**Severity if left unfixed:** unknown. Could be a non-issue (impersonation not actually needed) or a slow-burn correctness gap (some fraction of donation URLs fail silently as the rtl.nl one did, but for fingerprint reasons that impersonation would fix).
+
+**Bake-notes cross-reference:** `docs/SRC-BAKE-NOTES.md` § "Plan B Epic 3 findings surfaced during bake" — Finding 2.
+
 
