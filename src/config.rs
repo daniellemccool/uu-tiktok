@@ -18,6 +18,11 @@ pub struct Config {
 
     pub ytdlp_timeout: Duration,
     pub transcribe_timeout: Duration,
+    // AD0002: T8 adds this field; wired into pipeline in T-pipeline when
+    // process_one constructs PerCallConfig from Config. Until then, suppress
+    // the dead_code warning.
+    #[allow(dead_code)]
+    pub compute_lang_probs: bool,
 }
 
 impl Config {
@@ -36,6 +41,7 @@ impl Config {
                 whisper_threads: num_cpus_safe(),
                 ytdlp_timeout: Duration::from_secs(300),
                 transcribe_timeout: Duration::from_secs(600),
+                compute_lang_probs: args.compute_lang_probs,
             },
         }
     }
@@ -59,6 +65,7 @@ mod tests {
             transcripts: PathBuf::from("/tmp/out"),
             log_format: crate::cli::LogFormat::Human,
             whisper_model: None,
+            compute_lang_probs: false,
         }
     }
 

@@ -271,9 +271,6 @@ pub struct PerCallConfig {
     pub language: Option<String>,
     /// If true, an extra encoder pass populates TranscribeOutput::lang_probs.
     /// See sharp-edges.md:13 — calling lang_detect re-encodes the audio.
-    // AD0002: T8 wires the opt-in `--compute-lang-probs` path; until then the
-    // field is constructed (Default) but never read by the worker.
-    #[allow(dead_code)]
     pub compute_lang_probs: bool,
 }
 
@@ -431,13 +428,29 @@ impl WhisperEngine {
                     Ok(s) => s,
                     Err(e) => {
                         let _ = init_tx.send(Err(WhisperInitError::StateCreate {
-                            detail: format!("{e}"),
+                            detail: format!("primary state: {e}"),
                         }));
                         return;
                     }
                 };
 
-                // Init success: model AND state both loaded.
+                // T8 NEW: secondary state used only for opt-in lang_detect.
+                // Lives for the worker's lifetime (always allocated; only used when
+                // req.config.compute_lang_probs is true). See sharp-edges.md:15 —
+                // whisper_lang_auto_detect_with_state clobbers state (reuses
+                // decoders[0] and logits), so it must NOT run on the primary state
+                // used for inference.
+                let mut lang_state = match ctx.create_state() {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let _ = init_tx.send(Err(WhisperInitError::StateCreate {
+                            detail: format!("lang_state: {e}"),
+                        }));
+                        return;
+                    }
+                };
+
+                // Init success: model AND both states loaded.
                 if init_tx.send(Ok(())).is_err() {
                     return; // caller went away
                 }
@@ -452,6 +465,18 @@ impl WhisperEngine {
                     .to_string();
 
                 while let Some(req) = request_rx.blocking_recv() {
+                    // Early cancellation check: if the caller already dropped
+                    // the future (CancelOnDrop fired) or the deadline elapsed
+                    // before we even dequeued the request, return Cancelled
+                    // without doing any encoder work — including the opt-in
+                    // lang_detect pass.
+                    if req.cancel.load(std::sync::atomic::Ordering::Relaxed)
+                        || Instant::now() >= req.deadline
+                    {
+                        let _ = req.reply.send(Err(TranscribeError::Cancelled));
+                        continue;
+                    }
+
                     // FullParams configuration — embedding hygiene defaults per
                     // AD0013 + sharp-edges.md:66 (`print_progress = true` is the
                     // upstream default).
@@ -519,6 +544,84 @@ impl WhisperEngine {
                             .set_abort_callback_user_data(abort_user_data as *mut std::ffi::c_void);
                     }
 
+                    // Compute lang_probs only when opt-in. Pays an extra encoder
+                    // pass per sharp-edges.md:13 — lang_detect re-encodes the
+                    // audio. Run on lang_state (separate from primary state) so
+                    // it doesn't clobber the primary state's logits per
+                    // sharp-edges.md:15. Runs BEFORE state.full so the
+                    // lang_detect re-encode doesn't see post-inference state.
+                    //
+                    // Thread count: 4 matches whisper.cpp's default
+                    // (api-and-pipeline.md:51 — `n_threads = min(4, hw_concurrency)`).
+                    // Hardcoding 1 (as the brief originally pseudocoded) makes
+                    // the opt-in path slower than necessary on a CPU build;
+                    // whisper-rs's inference uses 4 too, so we match.
+                    //
+                    // Failure handling is best-effort by design: a pcm_to_mel
+                    // or lang_detect failure emits a tracing::warn! and yields
+                    // `lang_probs: None` rather than aborting the transcribe.
+                    // The primary inference (and its text + language output) is
+                    // the contractual value; lang_probs is the speculative
+                    // research signal. Epic 3's classification taxonomy may
+                    // reclassify (FOLLOWUPS tracks). The opt-in caller can
+                    // detect "feature requested but unavailable" via
+                    // `compute_lang_probs == true && lang_probs.is_none()`.
+                    //
+                    // AD0003 deviation from brief pseudocode:
+                    // - `lang_state.lang_detect()` returns `(i32, Vec<f32>)` not
+                    //   just `Vec<f32>`; we destructure and discard the detected
+                    //   lang_id (the primary inference gives us language via
+                    //   full_lang_id_from_state, which is more reliable).
+                    // - The probs Vec is pre-sized to get_lang_max_id()+1 by
+                    //   whisper-rs; no `.take(max_id+1)` needed.
+                    let lang_probs = if req.config.compute_lang_probs {
+                        match lang_state.pcm_to_mel(&req.samples, 4) {
+                            Ok(()) => match lang_state.lang_detect(0, 4) {
+                                Ok((_lang_id, probs_vec)) => {
+                                    let mut paired = Vec::with_capacity(probs_vec.len());
+                                    for (id, p) in probs_vec.iter().enumerate() {
+                                        if let Some(code) = whisper_rs::get_lang_str(id as i32) {
+                                            paired.push((code.to_string(), *p));
+                                        }
+                                    }
+                                    // Sort descending by probability for
+                                    // operator-readable JSON output.
+                                    paired.sort_by(|a, b| {
+                                        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                                    });
+                                    Some(paired)
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "lang_detect failed: {e}; emitting null lang_probs"
+                                    );
+                                    None
+                                }
+                            },
+                            Err(e) => {
+                                tracing::warn!("pcm_to_mel failed: {e}; emitting null lang_probs");
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+
+                    // Re-check cancellation after the opt-in lang_detect pass.
+                    // pcm_to_mel + lang_detect can take seconds; if the caller
+                    // dropped the future or the deadline elapsed during that
+                    // work, surface Cancelled before paying for primary inference.
+                    if req.cancel.load(std::sync::atomic::Ordering::Relaxed)
+                        || Instant::now() >= req.deadline
+                    {
+                        // Reclaim the abort closure box even on the early-exit
+                        // path; whisper.cpp's abort_callback won't fire here
+                        // (state.full not yet called) so this is safe.
+                        let _ = unsafe { Box::from_raw(abort_user_data) };
+                        let _ = req.reply.send(Err(TranscribeError::Cancelled));
+                        continue;
+                    }
+
                     let run_result = state.full(params, &req.samples);
 
                     // Reclaim the closure box now that whisper.cpp no longer
@@ -572,7 +675,7 @@ impl WhisperEngine {
                             let _ = req.reply.send(Ok(TranscribeOutput {
                                 text,
                                 language,
-                                lang_probs: None, // T8 wires the opt-in path
+                                lang_probs, // Some(paired) when opt-in, None otherwise
                                 segments: vec![], // T9 fills with raw signals
                                 model_id: model_id.clone(),
                             }));

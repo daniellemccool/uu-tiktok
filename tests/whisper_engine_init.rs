@@ -138,9 +138,15 @@ async fn transcribe_respects_short_deadline() {
     // deadline should trip the abort callback well before completion.
     //
     // Wallclock guard: if a regression breaks cancellation, the test should
-    // fail fast (within a few seconds) rather than hang to the harness timeout.
-    // The abort callback fires at ggml-level frequency so cancellation latency
-    // is sub-second; allow up to 10s for slow CI machines.
+    // fail before the harness timeout (60s+). The 30s upper bound accommodates
+    // CPU contention when whisper_engine_init's 5 model-loading tests run in
+    // parallel — each test allocates ~1GB of WhisperState buffers and competes
+    // for cores, so a 30s audio inference can take 10-15s elapsed under load
+    // even though the abort callback itself fires sub-second. A true hang
+    // (abort_callback never returns true; inference runs to natural completion
+    // under contention) would exceed 30s and be caught here. If this still
+    // flakes after future task additions, consider the `serial_test` crate
+    // tracked in FOLLOWUPS.
     let start = Instant::now();
     let result = engine
         .transcribe(
@@ -151,8 +157,8 @@ async fn transcribe_respects_short_deadline() {
         .await;
     let elapsed = start.elapsed();
     assert!(
-        elapsed < Duration::from_secs(10),
-        "transcribe took {elapsed:?} — possible cancellation regression"
+        elapsed < Duration::from_secs(30),
+        "transcribe took {elapsed:?} — possible cancellation regression or test-harness contention"
     );
 
     // Expect either Cancelled (most likely) or successful very short completion
@@ -167,6 +173,64 @@ async fn transcribe_respects_short_deadline() {
         }
         Err(e) => panic!("expected Cancelled or Ok, got {e:?}"),
     }
+
+    engine.shutdown();
+}
+
+#[tokio::test]
+async fn lang_probs_present_when_opt_in() {
+    if !tiny_model_path().exists() {
+        eprintln!("Skipping: model not on disk");
+        return;
+    }
+
+    let config = EngineConfig {
+        model_path: tiny_model_path(),
+        gpu_device: 0,
+        flash_attn: false,
+    };
+    let engine = WhisperEngine::new(&config).expect("engine loads");
+
+    let samples = uu_tiktok::audio::decode_wav(&silence_fixture_path()).expect("decode fixture");
+
+    // Without opt-in: lang_probs should be None
+    let output_default = engine
+        .transcribe(
+            samples.clone(),
+            PerCallConfig::default(),
+            Duration::from_secs(60),
+        )
+        .await
+        .expect("default transcribe succeeds");
+    assert!(
+        output_default.lang_probs.is_none(),
+        "lang_probs should be None by default"
+    );
+
+    // With opt-in: lang_probs should be Some(...) populated
+    let cfg = PerCallConfig {
+        compute_lang_probs: true,
+        ..PerCallConfig::default()
+    };
+    let output_with_probs = engine
+        .transcribe(samples, cfg, Duration::from_secs(60))
+        .await
+        .expect("opt-in transcribe succeeds");
+    assert!(
+        output_with_probs.lang_probs.is_some(),
+        "lang_probs should be Some when compute_lang_probs is true"
+    );
+    let probs = output_with_probs.lang_probs.unwrap();
+    assert!(
+        !probs.is_empty(),
+        "should have at least one language probability"
+    );
+    // Probabilities should sum to ~1.0
+    let sum: f32 = probs.iter().map(|(_, p)| p).sum();
+    assert!(
+        (sum - 1.0).abs() < 0.1,
+        "probs should sum to ~1.0, got {sum}"
+    );
 
     engine.shutdown();
 }

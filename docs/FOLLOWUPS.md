@@ -797,6 +797,81 @@ ADR.
 
 ---
 
+## Lazy-allocate lang_state on first opt-in request
+
+**Found in:** T8 (lang_probs opt-in) — codex-advisor code-quality review.
+**Disposition:** Defer; eager allocation is acceptable for Epic 1 but the lazy pattern is the efficient default.
+**Trigger to revisit:** Memory pressure becomes a binding constraint (multi-state per Plan C, or smaller dev VMs), OR Epic 4's `--compute-lang-probs` use becomes commonplace enough that the eager-allocation cost feels unjustified for non-opt-in workloads.
+
+T8 currently allocates `lang_state` unconditionally in `WhisperEngine::new`'s
+init phase. Since `compute_lang_probs` defaults false, every engine pays
+~500MB-1GB of unused WhisperState memory until the feature is opted in.
+
+Refactor target:
+
+```rust
+// In init phase: no lang_state allocation.
+// In worker request loop:
+let mut lang_state: Option<WhisperState> = None;
+// ...
+while let Some(req) = request_rx.blocking_recv() {
+    if req.config.compute_lang_probs {
+        if lang_state.is_none() {
+            // Lazy allocation on first opt-in. If it fails, surface as
+            // tracing::warn! + lang_probs: None (consistent with best-effort).
+            match ctx.create_state() {
+                Ok(s) => lang_state = Some(s),
+                Err(e) => { tracing::warn!(...); /* no lang_probs this call */ }
+            }
+        }
+        if let Some(ls) = lang_state.as_mut() {
+            // run lang_detect on ls
+        }
+    }
+    // ... rest of inference ...
+}
+```
+
+Trade-off: lazy saves ~500MB-1GB when feature is unused; costs a one-time
+allocation latency on first opt-in (~10-50ms on CPU; faster on GPU).
+
+---
+
+## Diagnostic log when lang_detect's top id disagrees with primary inference
+
+**Found in:** T8 (lang_probs opt-in) — codex-advisor code-quality review.
+**Disposition:** Bake-time debugging signal; not Epic 1 critical.
+**Trigger to revisit:** During T13's bake or when investigating language-detection accuracy regressions.
+
+T8 currently discards the `i32` lang_id returned by `lang_state.lang_detect(...)`
+(we destructure as `(_lang_id, probs_vec)`). When `req.config.language` is None
+(auto-detect mode), the primary inference's `full_lang_id_from_state()` is
+authoritative for the artifact, but a mismatch with `lang_detect`'s top id
+would be diagnostically interesting — it would indicate the auto-detect
+behavior is unstable across encoder passes.
+
+Add a `tracing::debug!` (or `info!` if rare enough) when
+`config.language.is_none() && top_lang_id_from_lang_detect != full_lang_id_from_state`,
+including both ids and the top probability. Useful during T13 bake when
+calibrating language-pin policy.
+
+---
+
+## whisper_engine_init integration tests serialize for cleaner timing assertions
+
+**Found in:** T8 (lang_probs opt-in) — wallclock guard in `transcribe_respects_short_deadline` had to be relaxed from 10s to 30s because parallel cargo test execution (5 whisper tests, each allocating ~1GB of WhisperState buffers and running model load + inference) causes 10s+ elapsed under CPU contention.
+**Disposition:** Defer; current 30s guard catches true hangs (which would exceed the test-harness 60s timeout). Revisit if flakiness recurs in T9+.
+**Trigger to revisit:** A subsequent `cargo test --features test-helpers` run shows whisper_engine_init flaking on `transcribe_respects_short_deadline` or any other tightly-timed test, OR T9/T11/T12 adds further whisper_engine_init tests that increase parallelism.
+
+Approaches when this comes up:
+1. Add `serial_test = "3"` to dev-deps; annotate `#[serial(whisper_engine_init)]` on each test. Cleanest semantics; adds one dev-dep.
+2. Move whisper_engine_init's tests into a single `#[tokio::test]` function (serial within tokio's runtime). Loses test isolation but no new deps.
+3. Document `cargo test -- --test-threads=1` for whisper_engine_init binary specifically (brittle; requires CI to know).
+
+Cost of (1) is one crate dep + ~5 attribute lines. Worth it if the tighter timing assertions become important again (e.g., catching a cancellation latency regression).
+
+---
+
 ## Revisit SamplingStrategy::Greedy { best_of } after T13 bake
 
 **Found in:** T7 (engine transcribe) — codex-advisor code-quality review.

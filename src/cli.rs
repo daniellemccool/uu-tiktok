@@ -36,6 +36,11 @@ pub struct GlobalArgs {
     /// Path to the whisper.cpp model file. Overrides the profile default.
     #[arg(long, env = "UU_TIKTOK_WHISPER_MODEL")]
     pub whisper_model: Option<PathBuf>,
+
+    /// Compute per-language probability distribution per video.
+    /// Costs one extra encoder pass per video; default false.
+    #[arg(long, env = "UU_TIKTOK_COMPUTE_LANG_PROBS", global = true)]
+    pub compute_lang_probs: bool,
 }
 
 #[derive(Subcommand, Debug)]
