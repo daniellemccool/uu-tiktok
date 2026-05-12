@@ -765,3 +765,33 @@ pub whisper_model: Option<PathBuf>,
 
 Should land alongside any future change touching the same struct.
 
+---
+
+## Consider promoting AD0010's pass-through rule to a meta-process ADR
+
+**Found in:** T1 (ADR drafts for Plan B Epic 1).
+**Disposition:** Deferred to Plan C planning.
+**Trigger to revisit:** When Plan C surfaces speculative-aggregation pressure for new derived data (comments, video metadata, etc.), evaluate whether the pass-through rule should be promoted from AD0010's scope to a standalone meta-process ADR alongside AD0001–3.
+
+The pass-through rule ("raw pass-through is canonical for research signals; only
+compute summaries needed for pipeline operation, indexing, or cheap sanity checks")
+is currently codified in AD0010 (raw_signals schema). It generalizes beyond Plan B
+Epic 1. If it surfaces in Plan C as a recurring pattern, promote it to a standalone
+ADR.
+
+---
+
+## T1 codex code-quality review — deferred ADR refinements
+
+**Found in:** T1 (ADR drafts for Plan B Epic 1) — codex-advisor code-quality review.
+**Disposition:** Deferred. Three blocking findings were resolved inline via `adg comment` (AD0010 schema_version-as-string; AD0012 cancellation-via-abort_callback; AD0016 closed-oneshot shutdown carve-out). The six items below are non-blocking for Epic 1.
+
+**Trigger to revisit:**
+
+- **AD0009 fallback Engine API preservation:** if the CUDA build fallback is ever invoked, the superseding ADR must preserve the public `WhisperEngine` API (samples in, `TranscribeOutput` out, `Arc<AtomicBool>` cancel) so T2–T12 implementations don't have to rewrite. Re-surface when the fallback ADR is drafted.
+- **AD0011 pause-safe checklist references AD0017:** AD0011's "before pause" checklist mentions only "no in_progress rows," but AD0017 defines a stricter pause-safe contract (counts by status + artifact existence + schema-version check). Tighten AD0011 to point at AD0017's contract once Epic 4's `status` subcommand exists. Re-surface in Epic 4 task expansion.
+- **AD0017 splits pause-safe vs batch-complete:** AD0017 currently conflates "every row terminal" with pause-safety. `failed_retryable` rows are pause-safe (no active work) but not batch-complete. Split into two semantics: `idle/pause-safe` = no in_progress + artifacts consistent for `succeeded`; `batch complete` = no `pending` or `failed_retryable` unless operator-accepted. Re-surface in Epic 4 task expansion.
+- **AD0013 global log callback invariant:** whisper.cpp's `whisper_log_set` is process-global, not per-engine. The invariant should be: install the callback once before any context init; route all whisper.cpp logs through one global bridge; do not replace per engine; backend capture must be scoped by init phase or protected by synchronization. Address in T6 implementation or amend AD0013 when Plan C multi-engine surfaces.
+- **AD0016 multi-engine GPU memory caution:** the "wraps `WhisperPool` of N Engines" alternative in AD0016 risks duplicating model loads on a single GPU (each Engine owns its own `WhisperContext`). Prefer multi-state on one context for same-GPU parallelism; keep the wrapper option only for multi-GPU or process isolation. Amend AD0016 when Plan C multi-state/multi-GPU work begins.
+- **Error variants enumeration:** AD0012/AD0013/AD0014/AD0016 reference typed error variants (`WhisperInitError::BackendMismatch`, `AudioDecodeError::*`, `TranscribeError::Cancelled`, worker-panic, closed-reply) but no ADR enumerates the canonical variant set. Add to T6/T7 implementation tasks (or write a small implementation-constraint ADR if the variants drift across files). Re-surface during T6 dispatch.
+
