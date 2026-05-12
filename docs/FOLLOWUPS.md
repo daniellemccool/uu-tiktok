@@ -795,3 +795,22 @@ ADR.
 - **AD0016 multi-engine GPU memory caution:** the "wraps `WhisperPool` of N Engines" alternative in AD0016 risks duplicating model loads on a single GPU (each Engine owns its own `WhisperContext`). Prefer multi-state on one context for same-GPU parallelism; keep the wrapper option only for multi-GPU or process isolation. Amend AD0016 when Plan C multi-state/multi-GPU work begins.
 - **Error variants enumeration:** AD0012/AD0013/AD0014/AD0016 reference typed error variants (`WhisperInitError::BackendMismatch`, `AudioDecodeError::*`, `TranscribeError::Cancelled`, worker-panic, closed-reply) but no ADR enumerates the canonical variant set. Add to T6/T7 implementation tasks (or write a small implementation-constraint ADR if the variants drift across files). Re-surface during T6 dispatch.
 
+---
+
+## `adg comment` rewrites the rendered Comments section with only the latest entry
+
+**Found in:** T2 (cargo-deps amendment to AD0009 via `adg comment`).
+**Disposition:** Tool quirk; tracked but not blocking.
+**Trigger to revisit:** If future ADR amendments require the full comment history visible in the rendered body — e.g., a multi-step decision with several attributed clarifications.
+
+When `adg comment --id NNNN` is invoked on an ADR that already has comments,
+the rendered .md body's `## Comments` section is rewritten to show only the
+new comment's anchor and line; prior comments remain in `index.yaml` but their
+`<a name="comment-N"></a>` anchors disappear from the body. `adg validate`
+accepts this state (it checks the anchors that ARE present, not that all
+indexed comments are anchored). Workaround for T2: manually restored
+comment-1's anchor in AD0009 before commit so the rendered body matches
+`index.yaml`'s comment list. If this pattern recurs in T3-T12, propose an
+upstream `adg` fix.
+
+

@@ -23,8 +23,7 @@ fn ingest_news_orgs_fixture_writes_videos_and_watch_history() {
     let tmp = TempDir::new().unwrap();
     let mut store = Store::open(&tmp.path().join("state.sqlite")).unwrap();
 
-    let stats: IngestStats =
-        ingest(&news_orgs_fixture(), &mut store).expect("ingest succeeds");
+    let stats: IngestStats = ingest(&news_orgs_fixture(), &mut store).expect("ingest succeeds");
 
     // Fixture has 20 unique videos and 25 watch_history rows (5 are
     // re-watches at distinct timestamps).
