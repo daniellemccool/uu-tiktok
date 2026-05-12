@@ -1,0 +1,26 @@
+{
+  "skill_name": "whisper-cpp",
+  "evals": [
+    {
+      "id": 0,
+      "name": "no-speech-prob-from-cli",
+      "prompt": "I'm using whisper-cli with -ojf to get JSON output and I need the no_speech_prob per segment for our confidence filtering, but I don't see it anywhere in the JSON. Is there a flag I'm missing or do I need to use a different approach? We're using whisper.cpp built from source.",
+      "expected_output": "Identifies that the CLI's JSON-full output does not include no_speech_prob, points to whisper-server's verbose_json format as the easy fix, mentions C API as the embedded alternative. Should not invent a flag.",
+      "files": []
+    },
+    {
+      "id": 1,
+      "name": "two-gpu-parallelism",
+      "prompt": "Setting up the transcription server. We have a box with 2x A10 GPUs and need to transcribe ~1M short TikTok audio files within a week or two. What's the right way to parallelize this in whisper.cpp -- how many concurrent transcriptions per GPU, and how do I configure whisper.cpp to actually use both GPUs?",
+      "expected_output": "Open one whisper_context per GPU via cparams.gpu_device=0 and =1. Allocate multiple whisper_state per context (2-3 recommended) for intra-GPU concurrency. Warns against whisper_full_parallel for independent files. Mentions flash_attn is default-on. Concrete enough to act on.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "name": "vad-clipping",
+      "prompt": "VAD is sometimes cutting off the first word of a TikTok in our pipeline. I'm using the default Silero VAD config that ships with whisper.cpp. Which parameter do I tune to fix this?",
+      "expected_output": "Identifies speech_pad_ms as the parameter, notes default is 30ms, suggests bumping to 50-100ms. May also mention threshold adjustment for quiet/whispered audio.",
+      "files": []
+    }
+  ]
+}

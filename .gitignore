@@ -15,6 +15,20 @@ state.sqlite-shm
 manifest.parquet
 *.tmp
 
+# Downloaded whisper.cpp model binaries (large; fetched via scripts/fetch-tiny-model.sh)
+models/
+
+# Runtime logs
+process.log
+
+# Operator-local notes (each developer keeps their own)
+testnotes.txt
+
+# Real-looking test fixtures kept on disk for ad-hoc development but
+# never committed. Synthetic-only fixtures are tracked under their own
+# subdirectories.
+tests/fixtures/ddp/20260416_test/
+
 # Editor / OS
 .DS_Store
 *.swp
@@ -27,3 +41,8 @@ manifest.parquet
 
 # Other tool session state
 .codex
+
+
+# Added by cargo
+
+/target
