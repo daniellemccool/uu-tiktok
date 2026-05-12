@@ -797,6 +797,25 @@ ADR.
 
 ---
 
+## T9 integration test only exercises empty-segment path on silence fixture
+
+**Found in:** T9 (raw signals extraction) — codex-advisor code-quality review.
+**Disposition:** T13's bake exercises the non-empty path with real spoken audio; no Epic 1 action.
+**Trigger to revisit:** A spoken-English fixture is added to `tests/fixtures/audio/` (likely during T13 bake setup).
+
+`transcribe_populates_raw_signals_segments_and_tokens` uses the silence fixture,
+which whisper.cpp typically reduces to zero segments. The structural range
+assertions (`p in [0.0, 1.0]`, `plog <= 0`, `id >= 0`) are therefore vacuously
+true — the per-token extraction loop is never exercised. The non-finite-f32
+detection in `extract_segments` and the range guards (codex #2) are similarly
+exercised only implicitly via successful inference.
+
+When a spoken-English fixture (say 5-10 seconds, CC0-licensed) is added to
+`tests/fixtures/audio/`, this test gains real coverage. Until then, T13's
+A10 bake against real TikTok audio is the integration check.
+
+---
+
 ## Lazy-allocate lang_state on first opt-in request
 
 **Found in:** T8 (lang_probs opt-in) — codex-advisor code-quality review.

@@ -149,8 +149,6 @@ pub struct TranscribeOutput {
 }
 
 /// Per-segment raw confidence signals from whisper.cpp.
-// AD0002: unused until T9+.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SegmentRaw {
     /// whisper_full_get_segment_no_speech_prob(state, i)
@@ -160,14 +158,122 @@ pub struct SegmentRaw {
 }
 
 /// Per-token confidence signals from whisper.cpp.
-// AD0002: unused until T9+.
-#[allow(dead_code)]
+///
+/// `id` and `text` carry token identity so downstream consumers can filter
+/// special tokens (`[BEG]`, `[END]`, `<|en|>`, etc.) per AD0010's pass-through
+/// rule — the prior shape (only `p`/`plog`) numerically included specials but
+/// gave consumers no way to identify them.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TokenRaw {
+    /// Token id as an index into the model's vocabulary
+    /// (`WhisperToken::token_id()`). Special tokens (timestamp, language, BEG,
+    /// END, NOT, SOT, EOT, etc.) have id values documented in whisper.cpp.
+    pub id: i32,
+    /// Token text from `WhisperToken::to_str_lossy()`. May contain non-UTF-8
+    /// fragments for multi-byte tokens that span split-points; lossy variant
+    /// substitutes replacement chars rather than failing the whole extraction.
+    pub text: String,
     /// whisper_full_get_token_p(state, i, j) — token probability in [0.0, 1.0]
     pub p: f32,
     /// Token log-probability (TokenData::plog from whisper-rs)
     pub plog: f32,
+}
+
+/// Extract per-segment and per-token raw confidence signals from whisper state.
+///
+/// AD0003 deviation: whisper-rs 0.16.0 does not expose flat
+/// `full_get_segment_no_speech_prob` / `full_n_tokens` / `full_get_token_data`
+/// methods on `WhisperState`. Everything is accessed via the wrapper types
+/// `WhisperSegment` (via `state.get_segment(i)`) and `WhisperToken`
+/// (via `seg.get_token(j)`). `WhisperSegment::no_speech_probability()` and
+/// `WhisperToken::token_data()` return values directly (not `Result`), so there
+/// is no getter-error path to skip — non-finite values are the only error
+/// condition and are surfaced as `Err(detail)`.
+///
+/// Returns `Ok(Vec<SegmentRaw>)` on success, or `Err(String)` with a
+/// human-readable diagnostic when a non-finite f32 is encountered (codex T4
+/// review forward-pointer: non-finite values must surface as `TranscribeError::Bug`).
+///
+/// Special tokens (`[BEG]`, `[END]`, language tokens like `<|en|>`, etc.) are
+/// retained per AD0010's pass-through rule — downstream consumers filter them.
+fn extract_segments(state: &whisper_rs::WhisperState) -> Result<Vec<SegmentRaw>, String> {
+    let n_segments = state.full_n_segments();
+    if n_segments < 0 {
+        return Err(format!(
+            "whisper-rs returned negative n_segments: {n_segments}"
+        ));
+    }
+    let mut segments_raw = Vec::with_capacity(n_segments as usize);
+
+    for i in 0..n_segments {
+        // `get_segment` returns None only when `i` is out of bounds — but we
+        // are iterating 0..n_segments so this is an invariant violation if it
+        // fires. Treat it as a Bug.
+        let seg = state
+            .get_segment(i)
+            .ok_or_else(|| format!("whisper-rs returned None for in-bounds segment {i}"))?;
+
+        let no_speech_prob = seg.no_speech_probability();
+        if !no_speech_prob.is_finite() || !(0.0..=1.0).contains(&no_speech_prob) {
+            return Err(format!(
+                "whisper-rs returned out-of-range no_speech_prob at segment {i}: \
+                 {no_speech_prob} (expected finite, [0.0, 1.0])"
+            ));
+        }
+
+        let n_tokens = seg.n_tokens();
+        if n_tokens < 0 {
+            return Err(format!(
+                "whisper-rs returned negative n_tokens at segment {i}: {n_tokens}"
+            ));
+        }
+        let mut tokens_raw = Vec::with_capacity(n_tokens as usize);
+
+        for j in 0..n_tokens {
+            // Same invariant argument as for segments above.
+            let tok = seg.get_token(j).ok_or_else(|| {
+                format!("whisper-rs returned None for in-bounds token {j} in segment {i}")
+            })?;
+
+            let td = tok.token_data();
+            if !td.p.is_finite() || !(0.0..=1.0).contains(&td.p) {
+                return Err(format!(
+                    "whisper-rs returned out-of-range p at segment {i} token {j}: \
+                     {p} (expected finite, [0.0, 1.0])",
+                    p = td.p,
+                ));
+            }
+            if !td.plog.is_finite() || td.plog > 0.0001 {
+                return Err(format!(
+                    "whisper-rs returned invalid plog at segment {i} token {j}: \
+                     {pl} (expected finite, <= 0)",
+                    pl = td.plog,
+                ));
+            }
+
+            // Token text via to_str_lossy: substitutes replacement chars on
+            // non-UTF-8 byte sequences (common for multi-byte tokens that span
+            // split-points). Better than erroring out and losing the artifact.
+            let text = tok
+                .to_str_lossy()
+                .map(|s| s.into_owned())
+                .unwrap_or_default();
+
+            tokens_raw.push(TokenRaw {
+                id: tok.token_id(),
+                text,
+                p: td.p,
+                plog: td.plog,
+            });
+        }
+
+        segments_raw.push(SegmentRaw {
+            no_speech_prob,
+            tokens: tokens_raw,
+        });
+    }
+
+    Ok(segments_raw)
 }
 
 #[cfg(test)]
@@ -183,10 +289,14 @@ mod plan_b_tests {
                 no_speech_prob: 0.02,
                 tokens: vec![
                     TokenRaw {
+                        id: 1000,
+                        text: "Hello".to_string(),
                         p: 0.99,
                         plog: -0.01,
                     },
                     TokenRaw {
+                        id: 1001,
+                        text: " world".to_string(),
                         p: 0.95,
                         plog: -0.05,
                     },
@@ -647,12 +757,10 @@ impl WhisperEngine {
                             }));
                         }
                         Ok(()) => {
-                            // Extract text. Raw signal extraction (segments +
-                            // tokens) lands in T9 — return empty `segments` here
-                            // so T9 can extend without restructuring.
-                            // AD0003 deviation note: whisper-rs 0.16.0 has no
-                            // `full_get_segment_text`; use `get_segment(i)` +
-                            // `WhisperSegment::to_str()` instead.
+                            // Extract text and raw signals in one pass over
+                            // segments. AD0003 deviation note: whisper-rs 0.16.0
+                            // has no `full_get_segment_text`; use `get_segment(i)`
+                            // + `WhisperSegment::to_str()` instead.
                             let n_segments = state.full_n_segments();
                             let mut text = String::new();
                             for i in 0..n_segments {
@@ -672,11 +780,22 @@ impl WhisperEngine {
                                 .unwrap_or("unknown")
                                 .to_string();
 
+                            // T9: extract raw signals. Non-finite values in
+                            // the whisper-rs output surface as Bug per codex's
+                            // T4 review forward-pointer.
+                            let segments = match extract_segments(&state) {
+                                Ok(segs) => segs,
+                                Err(detail) => {
+                                    let _ = req.reply.send(Err(TranscribeError::Bug { detail }));
+                                    continue;
+                                }
+                            };
+
                             let _ = req.reply.send(Ok(TranscribeOutput {
                                 text,
                                 language,
                                 lang_probs, // Some(paired) when opt-in, None otherwise
-                                segments: vec![], // T9 fills with raw signals
+                                segments,
                                 model_id: model_id.clone(),
                             }));
                         }

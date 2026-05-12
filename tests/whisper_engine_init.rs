@@ -106,11 +106,16 @@ async fn transcribe_silence_returns_empty_or_short_text() {
         output.text
     );
     assert!(!output.language.is_empty(), "language should be set");
-    // T7 returns empty segments; T9 extends with raw signal extraction.
-    assert!(
-        output.segments.is_empty(),
-        "T7 returns empty segments; T9 fills them"
-    );
+    // T9: segments are now populated. For silence whisper.cpp may return
+    // zero or a small number of segments; either is acceptable.
+    // Structural range checks on any segments that do appear.
+    for (i, seg) in output.segments.iter().enumerate() {
+        assert!(
+            seg.no_speech_prob >= 0.0 && seg.no_speech_prob <= 1.0,
+            "segment {i} no_speech_prob out of range: {}",
+            seg.no_speech_prob
+        );
+    }
     // model_id pinned to the file_name() of the configured model path.
     assert_eq!(output.model_id, "ggml-tiny.en.bin");
 
@@ -231,6 +236,71 @@ async fn lang_probs_present_when_opt_in() {
         (sum - 1.0).abs() < 0.1,
         "probs should sum to ~1.0, got {sum}"
     );
+
+    engine.shutdown();
+}
+
+#[tokio::test]
+async fn transcribe_populates_raw_signals_segments_and_tokens() {
+    if !tiny_model_path().exists() {
+        eprintln!("Skipping: model not on disk");
+        return;
+    }
+
+    let config = EngineConfig {
+        model_path: tiny_model_path(),
+        gpu_device: 0,
+        flash_attn: false,
+    };
+    let engine = WhisperEngine::new(&config).expect("engine loads");
+
+    // Use a non-silent fixture so segments are likely non-empty.
+    // For Epic 1's bake we'll add a real spoken-English fixture; for now,
+    // silence may still produce one empty segment (whisper.cpp behavior).
+    // The test asserts structural shape, not content.
+    let samples = uu_tiktok::audio::decode_wav(&silence_fixture_path()).expect("decode fixture");
+
+    let output = engine
+        .transcribe(samples, PerCallConfig::default(), Duration::from_secs(60))
+        .await
+        .expect("transcribe succeeds");
+
+    // Every segment must have a no_speech_prob in [0.0, 1.0]
+    for (i, seg) in output.segments.iter().enumerate() {
+        assert!(
+            seg.no_speech_prob >= 0.0 && seg.no_speech_prob <= 1.0,
+            "segment {i} no_speech_prob out of range: {}",
+            seg.no_speech_prob
+        );
+        // Every token must have p in [0.0, 1.0], plog non-positive, and
+        // a non-negative id within the model's vocab range (tiny.en vocab is
+        // ~51864). We don't assert text content — whisper.cpp may emit special
+        // tokens (e.g., timestamp markers) whose text representation varies.
+        for (j, tok) in seg.tokens.iter().enumerate() {
+            assert!(
+                tok.p >= 0.0 && tok.p <= 1.0,
+                "segment {i} token {j} p out of range: {}",
+                tok.p
+            );
+            assert!(
+                tok.plog <= 0.0001,
+                "segment {i} token {j} plog should be non-positive log-prob, got {}",
+                tok.plog
+            );
+            assert!(
+                tok.id >= 0,
+                "segment {i} token {j} id should be non-negative, got {}",
+                tok.id
+            );
+        }
+    }
+
+    if !output.text.trim().is_empty() {
+        assert!(
+            !output.segments.is_empty(),
+            "non-empty text should produce non-empty segments"
+        );
+    }
 
     engine.shutdown();
 }
