@@ -797,6 +797,33 @@ ADR.
 
 ---
 
+## AD0013 backend assertion must be cfg(feature = "cuda")-gated
+
+**Found in:** T6 (engine init) — codex-advisor code-quality review.
+**Disposition:** Forward-pointer for T13's bake-runbook implementer.
+**Trigger to revisit:** During T13 dispatch.
+
+T6 currently calls `ctx_params.use_gpu(true)` unconditionally. On non-CUDA
+builds, whisper.cpp's CUDA backend is not compiled in and the load silently
+falls back to CPU — which is what we want for local dev. T13 adds the
+backend-mismatch assertion via `whisper_log_set`; the assertion must NOT
+fire on non-CUDA builds where CPU is the expected backend. Gate it via
+`cfg(feature = "cuda")` or an explicit `expected_backend` field on
+`EngineConfig`, e.g.:
+
+```rust
+#[cfg(feature = "cuda")]
+const EXPECTED_BACKEND: &str = "CUDA";
+#[cfg(not(feature = "cuda"))]
+const EXPECTED_BACKEND: &str = "CPU";
+```
+
+Then the log-callback bridge compares the captured backend string against
+`EXPECTED_BACKEND` and returns `WhisperInitError::BackendMismatch` only on
+mismatch.
+
+---
+
 ## WhisperEngine teardown can hang once T7 lands real inference
 
 **Found in:** T5 (engine shell) — codex-advisor code-quality review.

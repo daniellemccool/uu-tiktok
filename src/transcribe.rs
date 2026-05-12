@@ -258,9 +258,8 @@ use std::thread;
 use std::time::Instant;
 
 use tokio::sync::{mpsc, oneshot};
+use whisper_rs::{WhisperContext, WhisperContextParameters};
 
-// AD0002: shell types are unused until T6/T7 wire them in.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
     pub model_path: PathBuf,
@@ -279,7 +278,9 @@ pub struct PerCallConfig {
     pub compute_lang_probs: bool,
 }
 
-// AD0002: shell type — fields read inside the worker once T7 lands.
+// AD0002: shell type — most fields read inside the worker once T7 lands.
+// `samples`, `cancel`, `deadline` and `config` are written here in T6 but the
+// worker still ignores them; T7 wires them into whisper.cpp's parameters.
 #[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) struct TranscribeRequest {
@@ -294,13 +295,14 @@ pub(crate) struct TranscribeRequest {
     pub reply: oneshot::Sender<Result<TranscribeOutput, TranscribeError>>,
 }
 
-// AD0002: variants unused until T6 calls them.
-#[allow(dead_code)]
+// AD0002: BackendMismatch is constructed by T13's backend-assertion path;
+// suppress dead_code until then.
 #[derive(Debug, thiserror::Error)]
 pub enum WhisperInitError {
     #[error("loading whisper model from {path}: {detail}")]
     ModelLoad { path: String, detail: String },
 
+    #[allow(dead_code)]
     #[error(
         "backend mismatch: expected GPU but whisper.cpp engaged CPU fallback (sharp-edges.md:61)"
     )]
@@ -333,7 +335,8 @@ impl Drop for CancelOnDrop {
 /// dropped after the join attempt, the worker would park forever in
 /// `blocking_recv` and the join would hang. (Brief code had this hazard;
 /// AD0003 deviation — see commit body.)
-// AD0002: unused until T6/T7 wires the engine into the pipeline.
+// AD0002: still unused outside tests until T8 wires the engine into the
+// pipeline; tests cover the public surface.
 #[allow(dead_code)]
 pub struct WhisperEngine {
     request_tx: Option<mpsc::Sender<TranscribeRequest>>,
@@ -342,25 +345,97 @@ pub struct WhisperEngine {
 
 #[allow(dead_code)]
 impl WhisperEngine {
-    pub fn new(_config: &EngineConfig) -> Result<Self, WhisperInitError> {
-        // T6 inserts model load + GPU verification here. For T5 this is just
-        // the worker-channel + thread skeleton; whisper-rs is not imported yet.
-        //
+    /// Construct a WhisperEngine: spawn the worker thread, load the model,
+    /// verify init, return the handle.
+    ///
+    /// **Blocks the caller** until the worker reports init success or failure
+    /// via the internal rendezvous channel. Model load for tiny.en is ~1s on
+    /// CPU and faster on GPU; for large-v3-turbo expect a few seconds. Call
+    /// from a sync startup path (e.g., main()'s setup before the tokio runtime
+    /// hands off to async work) — not from inside a latency-sensitive async
+    /// task, because the rendezvous recv() will block the executor thread.
+    pub fn new(config: &EngineConfig) -> Result<Self, WhisperInitError> {
         // Channel capacity 1: each TranscribeRequest carries a Vec<f32> of decoded
         // audio (~MB scale for a single-minute video). Epic 1's serial pipeline
         // never needs more than one request in flight. Epic 2's pipelined
         // orchestrator decides its own outer queue depth.
         let (request_tx, mut request_rx) = mpsc::channel::<TranscribeRequest>(1);
 
+        let model_path = config.model_path.clone();
+        let gpu_device = config.gpu_device;
+        let flash_attn = config.flash_attn;
+
+        // Rendezvous channel to surface init errors back to the caller before
+        // the worker enters its request loop. std::sync::mpsc since the worker
+        // is a std::thread and the caller (this fn) is synchronous.
+        let (init_tx, init_rx) = std::sync::mpsc::sync_channel::<Result<(), WhisperInitError>>(0);
+
         let handle = thread::Builder::new()
             .name("uu-tiktok-whisper-worker".to_string())
             .spawn(move || {
+                // whisper-rs 0.16.0: setters take &mut self and return &mut Self.
+                // use_gpu(true) is harmless on a CPU build — whisper.cpp falls back.
+                // AD0013 backend-mismatch assertion lands in T13.
+                let mut ctx_params = WhisperContextParameters::default();
+                ctx_params
+                    .use_gpu(true)
+                    .flash_attn(flash_attn)
+                    .gpu_device(gpu_device);
+
+                // whisper-rs 0.16.0 accepts P: AsRef<Path>; pass the PathBuf directly.
+                // AD0003 deviation from brief sketch (brief did .to_str().unwrap_or("")).
+                let ctx_result = WhisperContext::new_with_params(&model_path, ctx_params);
+                let _ctx = match ctx_result {
+                    Ok(c) => {
+                        tracing::info!(
+                            gpu_device = gpu_device,
+                            flash_attn = flash_attn,
+                            model_path = %model_path.display(),
+                            "WhisperEngine: model loaded"
+                        );
+                        if init_tx.send(Ok(())).is_err() {
+                            return; // caller went away
+                        }
+                        c
+                    }
+                    Err(e) => {
+                        let _ = init_tx.send(Err(WhisperInitError::ModelLoad {
+                            path: model_path.display().to_string(),
+                            detail: format!("{e}"),
+                        }));
+                        return;
+                    }
+                };
+
+                // `_ctx` lives until this closure exits — keeps the model in
+                // memory for the worker's lifetime. AD0016: WhisperContext
+                // stays inside the worker thread; it never escapes.
+                //
+                // T7 SHAPE (read before implementing):
+                //   Allocate the WhisperState ONCE here (after init_tx.send(Ok)
+                //   above, before the request loop below) and reuse it for every
+                //   request:
+                //
+                //       let mut state = _ctx.create_state().map_err(...)?;
+                //       while let Some(req) = request_rx.blocking_recv() {
+                //           let mut params = FullParams::new(SamplingStrategy::Greedy { ... });
+                //           // ... configure abort_callback to poll req.cancel + req.deadline ...
+                //           state.full(params, &req.samples) ...
+                //       }
+                //
+                //   Per whisper.cpp's concurrency model (one-context-many-states,
+                //   see whisper-cpp deepdive concurrency.md): WhisperState owns
+                //   ~500MB-1GB of KV caches and compute buffers. Allocating one
+                //   per request would defeat Plan B's efficiency goal. Epic 1
+                //   ships single-state; Plan C may allocate N states per context
+                //   for intra-GPU parallelism (AD0016 architecture).
+
                 while let Some(req) = request_rx.blocking_recv() {
-                    // T7 inserts whisper_full_with_state + raw-signal extraction here.
-                    // T5 placeholder: every request replies with a Bug error so the
-                    // channel shape can be exercised end-to-end before T6/T7 land.
+                    // T7 placeholder: still Bug. T7 fills the inference body per
+                    // the SHAPE comment above (state allocated outside this loop).
                     let _ = req.reply.send(Err(TranscribeError::Bug {
-                        detail: "WhisperEngine not yet implemented (T5 shell)".to_string(),
+                        detail: "WhisperEngine::transcribe not yet implemented (T6 init only)"
+                            .to_string(),
                     }));
                 }
                 // Sender dropped → channel closed → orderly exit. Per AD0016
@@ -369,6 +444,23 @@ impl WhisperEngine {
             .map_err(|e| WhisperInitError::WorkerSpawn {
                 detail: format!("spawn whisper worker thread: {e}"),
             })?;
+
+        // Block this sync fn on the init result. WhisperEngine::new is sync,
+        // so blocking the calling thread on init_rx.recv() is fine.
+        match init_rx.recv() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                let _ = handle.join();
+                return Err(e);
+            }
+            Err(_) => {
+                let _ = handle.join();
+                return Err(WhisperInitError::ModelLoad {
+                    path: config.model_path.display().to_string(),
+                    detail: "worker thread died before sending init result".to_string(),
+                });
+            }
+        }
 
         Ok(Self {
             request_tx: Some(request_tx),
@@ -443,50 +535,20 @@ impl Drop for WhisperEngine {
     }
 }
 
-#[cfg(test)]
-mod engine_tests {
-    use super::*;
-
-    fn dummy_config() -> EngineConfig {
-        EngineConfig {
-            model_path: PathBuf::from("/dev/null"),
-            gpu_device: 0,
-            flash_attn: false,
-        }
-    }
-
-    #[tokio::test]
-    async fn shell_returns_bug_error_on_transcribe() {
-        let engine = WhisperEngine::new(&dummy_config()).expect("shell construction succeeds");
-        let result = engine
-            .transcribe(
-                vec![0.0_f32; 16000],
-                PerCallConfig::default(),
-                Duration::from_secs(5),
-            )
-            .await;
-        assert!(matches!(result, Err(TranscribeError::Bug { .. })));
-        engine.shutdown();
-    }
-
-    // Renamed from the brief's `shell_send_closed_after_shutdown`: the body
-    // checks clean shutdown timing, not closed-send semantics. T7 will cover
-    // the closed-oneshot Bug path more thoroughly once real inference lands.
-    #[tokio::test]
-    async fn shutdown_joins_cleanly() {
-        let engine = WhisperEngine::new(&dummy_config()).expect("shell construction succeeds");
-        let start = Instant::now();
-        engine.shutdown();
-        // If teardown ordering were wrong (join before sender-drop) this would
-        // hang until the test harness timeout. Guard with a generous bound so
-        // a regression surfaces as a clear assertion rather than a 60s timeout.
-        let elapsed = start.elapsed();
-        assert!(
-            elapsed < Duration::from_secs(2),
-            "shutdown took {elapsed:?}; expected sub-second teardown — possible deadlock"
-        );
-    }
-}
+// T5's `engine_tests` module is removed in T6.
+//
+// Both T5 tests (`shell_returns_bug_error_on_transcribe`, `shutdown_joins_cleanly`)
+// used a `dummy_config()` pointing model_path at `/dev/null` and relied on
+// `WhisperEngine::new` NOT actually loading the model. T6's `new` does load
+// the model, so `/dev/null` now correctly fails before construction returns,
+// making the T5 assertions unreachable. The replacements live in
+// `tests/whisper_engine_init.rs` (test-helpers gated, uses ggml-tiny.en.bin):
+//   - engine_loads_tiny_en_model_successfully → exercises load → transcribe
+//     returns Bug → shutdown teardown (the missing shutdown-timing micro-
+//     assertion is implicit: a teardown deadlock would hang the test harness).
+//   - engine_rejects_missing_model_path → exercises the WhisperInitError
+//     path that T5's `/dev/null`-construct-then-Bug-on-transcribe could not.
+// See AD0003 deviation disclosure in the commit body.
 
 #[cfg(test)]
 mod tests {
