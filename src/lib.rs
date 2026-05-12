@@ -1,3 +1,4 @@
+pub mod audio;
 pub mod canonical;
 pub mod errors;
 pub mod fetcher;

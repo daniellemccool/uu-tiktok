@@ -797,6 +797,14 @@ ADR.
 
 ---
 
+## `decode_wav` trusts float-format WAV sample values
+
+**Found in:** T3 (WAV decoder) — codex-advisor code-quality review.
+**Disposition:** Deferred. yt-dlp's ffmpeg postprocessor emits PCM_S16LE in Plan B; the float path in `decode_wav` is dead code for production input and the cost-vs-benefit of validating it now is low.
+**Trigger to revisit:** If any future fetcher (Plan C API direct, alternate downloaders) introduces float-format WAV input, add finite/range validation to `src/audio.rs:decode_wav`'s `SampleFormat::Float` arm — reject `NaN`, `inf`, and out-of-`[-1.0, 1.0]` values with a new `AudioDecodeError` variant. The module is the audio invariant boundary; the float path should not trust whatever hound yields.
+
+---
+
 ## `adg comment` rewrites the rendered Comments section with only the latest entry
 
 **Found in:** T2 (cargo-deps amendment to AD0009 via `adg comment`).
