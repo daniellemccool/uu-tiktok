@@ -158,6 +158,8 @@ Both findings are now well-supported with concrete fix paths; full FOLLOWUPS ent
 
 **Production impact:** unknown. Initial assumption ("TikTok IP-blocks SURF datacenter") was withdrawn after the apparent block message turned out to be a URL typo. Whether impersonation is actually needed to fetch most TikTok content reliably from SURF workspaces is an open question — needs a focused mini-bake of N=20+ videos with and without working impersonation.
 
+**2026-05-13 update — Finding 1 fix landed; Finding 2 resolved.** The yt-dlp format selector was switched to `download/b[vcodec=h264]/b` (commit `cb6f214`, PR #2); Finding 2's root cause turned out to be a curl_cffi version mismatch, not the libcurl-linkage hypothesis above. See `docs/FOLLOWUPS.md` for the corrected analysis and the operator runbook line (`pipx install 'yt-dlp[default,curl-cffi]'`). Both findings closed for the immediate bake retrospective; the residual Epic 3 retry work and the N=20+ impersonation-on-vs-off mini-bake remain open as separate concerns.
+
 ---
 
 ## Workspace metadata

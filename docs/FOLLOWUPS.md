@@ -1129,35 +1129,33 @@ The selector workaround and the Epic 3 retry compose cleanly — prevention redu
 
 ---
 
-## `pipx inject yt-dlp curl-cffi` reports success but yt-dlp still cannot activate impersonation
+## RESOLVED 2026-05-13: `pipx inject yt-dlp curl-cffi` left yt-dlp with an unsupported curl_cffi version
 
-**Found in:** T13 bake (workspace-side fetcher hardening attempt).
-**Disposition:** Deferred to Plan B Epic 3 (or a focused mini-bake to determine whether impersonation is required at scale).
-**Trigger to revisit:** Epic 3 fetcher hardening; OR a focused mini-bake of N=20+ TikTok URLs from a representative donation sample, with and without working impersonation, to establish whether the impersonation gap actually affects fetch success rate.
+**Found in:** T13 bake (workspace-side fetcher hardening attempt). Resolved on the SRC A10 workspace 2026-05-13.
+**Original hypothesis (wrong, never verified):** missing `libcurl4-openssl-dev` causing the C extension to build without proper libcurl linkage.
+**Actual root cause:** `pipx inject yt-dlp curl-cffi` (unpinned) grabbed `curl-cffi 0.15.0` — the latest release at bake time. yt-dlp 2026.03.17's networking handler at `yt_dlp/networking/_curlcffi.py:34-37` parses the curl_cffi version into a tuple and dynamically appends `(unsupported)` to the version string when the bound check fails. Empirically: yt-dlp 2026.03.17 accepts `0.14.0`, rejects `0.15.0`. The package was correctly installed and importable (`import curl_cffi` succeeded cleanly), but yt-dlp refused to load the handler at request-time, so `Request Handlers: urllib` (no curl_cffi) and all impersonate targets showed `(unavailable)`.
 
-**Reproduction observed during bake:**
+**Resolution:** `pipx install --force 'yt-dlp[default,curl-cffi]'` on the SRC workspace. This wipes the existing pipx venv and reinstalls yt-dlp with both:
 
-1. `pipx inject yt-dlp curl-cffi 2>&1` reports `injected package curl-cffi into venv yt-dlp ✨ 🌟 ✨` — success on the pipx side.
-2. `yt-dlp --list-impersonate-targets` continues to show all targets (Chrome, Firefox, Edge, Safari, Tor) as `(unavailable)`.
-3. Every subsequent `yt-dlp` invocation still emits the warning: `The extractor is attempting impersonation, but no impersonate target is available. If you encounter errors, then see https://github.com/yt-dlp/yt-dlp#impersonation`.
+- `[default]` — the full tested-recommended optional-dependency set (Cryptodome, brotli, mutagen, requests/urllib3/websockets, yt_dlp_ejs)
+- `[curl-cffi]` — lets yt-dlp's own setup.py resolve to a curl-cffi version it tested against (resolved to `curl-cffi 0.14.0`)
 
-**Hypothesis (not confirmed during the bake — diagnostic curtailed for paste-friction reasons):**
+Verification on the A10 (`yt-dlp -v --list-impersonate-targets`):
 
-The injected curl-cffi C extension may have built without proper libcurl linkage. The diagnostic command `~/.local/share/pipx/venvs/yt-dlp/bin/python -c "from curl_cffi import requests; print('ok')"` was prepared but not run. If it fails with an OSError or ImportError about libcurl, the fix is likely:
+- Before: `Optional libraries: ..., curl_cffi-0.15.0 (unsupported), ...` + `Request Handlers: urllib` + all 5 targets `(unavailable)`.
+- After: `Optional libraries: Cryptodome-3.23.0, brotli-1.2.0, certifi-2026.04.22, curl_cffi-0.14.0, mutagen-1.47.0, requests-2.34.0, sqlite3-3.45.1, urllib3-2.7.0, websockets-16.0, yt_dlp_ejs-0.8.0` + `Request Handlers: urllib, requests, websockets, curl_cffi` + 25+ impersonate targets `(available)`.
+- Real-URL verification on `@pbsnews/video/7609743407577173262 --simulate`: no `attempting impersonation, but no impersonate target is available` warning.
 
-```sh
-sudo apt install -y libcurl4-openssl-dev
-pipx inject yt-dlp 'curl-cffi>=0.11' --force
-```
+**Operator runbook line for fresh SRC workspace provisioning:** install yt-dlp via `pipx install 'yt-dlp[default,curl-cffi]'`. Do NOT use `pip install` (Ubuntu 24.04's PEP 668 externally-managed-environment marker blocks it). Do NOT use `pipx inject yt-dlp curl-cffi` unpinned (will grab a curl-cffi version yt-dlp may reject). If something already in the venv must be preserved, fall back to `pipx inject yt-dlp 'curl-cffi==<X>' --force` with `<X>` matching yt-dlp's tested range.
 
-before retrying `--list-impersonate-targets`.
+**Lessons captured:**
 
-**Open question — whether impersonation is actually load-bearing:** Initial assumption during the bake ("TikTok IP-blocks SURF datacenter IPs") was withdrawn after the apparent block message turned out to be a URL typo on a manual probe. The single observed fetcher failure (rtl.nl video) was caused by yt-dlp's format-selection issue (separate FOLLOWUPS entry above), NOT by IP reputation or fingerprint blocking. Whether impersonation is needed to fetch the bulk of donation TikTok content from SURF workspaces reliably is unknown. A focused mini-bake of N=20+ URLs from a representative sample, with and without working impersonation, would settle the question.
+1. `pipx install --force '<tool>[extras]'` lets the tool's packaging declare its tested-compatible optional-dep versions, rather than relying on operator guesses or pipx's default-latest. This is the cleanest install pattern when an optional dep has version-range constraints.
+2. yt-dlp marks dep status dynamically via the `_yt_dlp__version` attribute (`_curlcffi.py:37`), so the verbose `--list-impersonate-targets` output is the load-bearing diagnostic — not the bare `import curl_cffi` test the bake initially proposed.
+3. The original bake-time hypothesis was carried forward without verification. The systematic-debugging discipline — diagnostic *before* fix — would have caught the wrong-hypothesis path earlier. Future FOLLOWUPS entries should mark unverified hypotheses explicitly as `**Hypothesis (unverified):**` so subsequent operators don't apply fixes built on guesses.
 
-**Empirical update (2026-05-13):** Verified the no-audio bug today against 6 fixture URLs from a local Arch machine *without* working impersonation (the warning was visible on every yt-dlp invocation). All 6 succeeded after applying the `-f "download/b[vcodec=h264]/b"` selector. This confirms impersonation is NOT load-bearing for the no-audio failure mode — the two issues are orthogonal. The impersonation question stands open for other resilience purposes (rate-limit avoidance, fingerprint blocking on different fixtures); the proposed N=20+ mini-bake would still be the way to close it out.
+**Still open (separate question, not blocked by this resolution):** whether working impersonation actually changes anything at SURF scale. Both today's local 6-URL verification (without impersonation) and the A10 8-URL run (without impersonation) succeeded cleanly on real Dutch/English/Tagalog content. The "is impersonation needed at small scale" question is empirically leaning toward "no," but the N=20+ comparator mini-bake (impersonation on vs off on a representative URL sample) would settle it definitively. This question stands as a separate FOLLOWUPS for Plan B Epic 3 / production-grant scoping.
 
-**Severity if left unfixed:** unknown. Could be a non-issue (impersonation not actually needed) or a slow-burn correctness gap (some fraction of donation URLs fail silently as the rtl.nl one did, but for fingerprint reasons that impersonation would fix).
-
-**Bake-notes cross-reference:** `docs/SRC-BAKE-NOTES.md` § "Plan B Epic 3 findings surfaced during bake" — Finding 2.
+**Bake-notes cross-reference:** `docs/SRC-BAKE-NOTES.md` § "Plan B Epic 3 findings surfaced during bake" — Finding 2 (now resolved by this entry).
 
 
