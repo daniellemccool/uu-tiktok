@@ -1107,27 +1107,25 @@ might become useful for re-claiming a row.
 
 ---
 
-## YtDlpFetcher's `-x` auto-format-selection picks phantom video-only TikTok streams
+## Residual yt-dlp no-audio failure rate after format-preference workaround
 
-**Found in:** T13 bake (per-model loop on `news_orgs` fixture, video #2 = `7571766274108181792` on `@rtl.nl`).
-**Disposition:** Deferred to Plan B Epic 3 (fetcher hardening alongside failure classification).
-**Trigger to revisit:** Epic 3 kickoff; OR sooner if any subsequent bake on a different fixture reproduces the same `ffprobe: unable to obtain file audio codec` failure.
+**Found in:** T13 bake (`@rtl.nl/video/7571766274108181792`); root-cause analysis 2026-05-13 against `yt_dlp/extractor/tiktok.py` v2026.03.17 + upstream issues yt-dlp/yt-dlp#15891 and yt-dlp/yt-dlp#16622.
+**Disposition:** Format-selector workaround landed on `fix/ytdlp-prefer-download` (selector switched from yt-dlp default to `"download/b[vcodec=h264]/b"`). Residual reliability gap deferred to Plan B Epic 3.
+**Trigger to revisit:** Epic 3 fetcher hardening; OR if pilot-scale bake observes the `unable to obtain file audio codec with ffprobe` error despite the workaround.
 
-**Reproduction observed during bake:**
+**Root cause (primary-source-confirmed):** TikTok's web API non-deterministically populates `bitrateInfo` with h265 variants that are served video-only at the CDN. yt-dlp's TikTok extractor (`tiktok.py:562-606`) unconditionally stamps `acodec: 'aac'` on every `bitrateInfo` entry via `COMMON_FORMAT_INFO`; it has no way to verify the claim. The default selector picks the highest-tbr format (often the lying h265 variant); the ffmpeg postprocessor then discovers via `ffprobe` that there is no audio stream. The bake-notes framing about "yt-dlp's auto-select walking OFF the listed menu" was a misreading: the listing and download invocations are separate API calls and can return different `bitrateInfo` arrays — the format isn't hidden, the API just rotates.
 
-1. `process --max-videos 5` fails at video #2 with `ERROR: Postprocessing: WARNING: unable to obtain file audio codec with ffprobe`.
-2. Manual reproduction: same yt-dlp invocation downloads `bytevc1_1080p_559269-1` — a format ID that does NOT appear in `yt-dlp --list-formats <url>` output (closest listed format is `bytevc1_1080p_583083-1`, different bitrate).
-3. `ffprobe -show_streams` on the downloaded MP4 shows ONLY `codec_type=video` (codec `hevc`); no audio stream present.
-4. `yt-dlp --list-formats` shows all visible formats have `acodec=aac` (combined video+audio). So yt-dlp's `--extract-audio` (`-x`) auto-select walked OFF the listed format menu and picked an internal DASH-style video-only segment.
-5. Explicit `-f "b"` (best combined) downloads the listed `bytevc1_1080p_583083-1` format and extracts a clean 4.4 MB WAV via ffmpeg. Confirmed fix.
+**Why the workaround works:** TikTok's `download` format (`tiktok.py:621-628`) is a pre-rendered share-link MP4 served as a static asset, distinct from the on-demand-muxed `bitrateInfo` pipeline. It's h264, pre-muxed, ~5 MiB at 540p, and empirically the most-validated path (it's what every "Save video" tap in the mobile app hits). Verified across 6 fixture URLs on 2026-05-13. The visible watermark only affects video pixels, which the pipeline discards.
 
-**The fix (one-line patch to `src/fetcher/ytdlp.rs`):** add `"-f", "ba/b"` (best audio-only OR best combined) to the yt-dlp argument list before the URL. Prefers audio-only when TikTok exposes a separate stream; falls back to best combined format when not. Robust against the auto-select walking off the listed format menu.
+**Residual gap Epic 3 should close:**
 
-**Why deferred, not fixed now:** Epic 3 owns the fetcher's full hardening sweep (typed error classification, default-cautious posture for unknown stderr, classifier rules for yt-dlp/ffmpeg patterns per spec § "Classification rules"). A one-line `-f "ba/b"` change here, dropped into Epic 1, would land outside that hardening pass and risk drifting from Epic 3's design. The current bake outcome (n=1 per model, all four models verified) does not require this fix; Plan B Epic 2's pipelined orchestrator will not require it either if Epic 2 introduces failure persistence (the rtl.nl video would just be marked `failed_retryable` and the loop would continue to subsequent videos).
+1. Classify `Postprocessing: WARNING: unable to obtain file audio codec with ffprobe` as `RetryableFailure::NoAudioStream` (a distinct variant from network errors / generic tool failures).
+2. On classification, retry the whole `acquire` against the same URL. TikTok's API non-determinism means a second invocation typically returns a different (working) format menu. Upstream issue #16622 confirms even h264-preferring filters intermittently produce no-audio downloads.
+3. Bound retries (e.g., 3 attempts with brief backoff) before marking the row `failed_retryable`.
 
-**Severity if left unfixed:** material at production scale. The Escobar/French video fetched fine; the rtl.nl video failed reproducibly. Failure rate at scale (1M-video production) is unknown until the patched fetcher is bake-tested on a representative URL sample. May correlate with TikTok account (newer-style DASH delivery vs older combined uploads).
+The selector workaround and the Epic 3 retry compose cleanly — prevention reduces the rate; retry catches the residual. Do NOT revert the selector when retry lands.
 
-**Bake-notes cross-reference:** `docs/SRC-BAKE-NOTES.md` § "Plan B Epic 3 findings surfaced during bake" — Finding 1.
+**Bake-notes cross-reference:** `docs/SRC-BAKE-NOTES.md` § "Plan B Epic 3 findings surfaced during bake" — Finding 1 (now superseded by this entry).
 
 ---
 
@@ -1155,6 +1153,8 @@ pipx inject yt-dlp 'curl-cffi>=0.11' --force
 before retrying `--list-impersonate-targets`.
 
 **Open question — whether impersonation is actually load-bearing:** Initial assumption during the bake ("TikTok IP-blocks SURF datacenter IPs") was withdrawn after the apparent block message turned out to be a URL typo on a manual probe. The single observed fetcher failure (rtl.nl video) was caused by yt-dlp's format-selection issue (separate FOLLOWUPS entry above), NOT by IP reputation or fingerprint blocking. Whether impersonation is needed to fetch the bulk of donation TikTok content from SURF workspaces reliably is unknown. A focused mini-bake of N=20+ URLs from a representative sample, with and without working impersonation, would settle the question.
+
+**Empirical update (2026-05-13):** Verified the no-audio bug today against 6 fixture URLs from a local Arch machine *without* working impersonation (the warning was visible on every yt-dlp invocation). All 6 succeeded after applying the `-f "download/b[vcodec=h264]/b"` selector. This confirms impersonation is NOT load-bearing for the no-audio failure mode — the two issues are orthogonal. The impersonation question stands open for other resilience purposes (rate-limit avoidance, fingerprint blocking on different fixtures); the proposed N=20+ mini-bake would still be the way to close it out.
 
 **Severity if left unfixed:** unknown. Could be a non-issue (impersonation not actually needed) or a slow-burn correctness gap (some fraction of donation URLs fail silently as the rtl.nl one did, but for fingerprint reasons that impersonation would fix).
 

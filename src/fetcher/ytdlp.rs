@@ -23,6 +23,43 @@ impl YtDlpFetcher {
     }
 }
 
+/// Build the yt-dlp argv and the expected output WAV path for a single video.
+///
+/// Pure function: no I/O, no global state. Unit-testable.
+///
+/// The `-f` selector prefers TikTok's `download` format — the pre-rendered
+/// share-link MP4 served as a static asset, h264 at ~540p, pre-muxed
+/// deterministically. It comes from a different TikTok pipeline than the
+/// `bitrateInfo` ABR variants documented in yt-dlp issues #15891 / #16622,
+/// which intermittently serve h265 video-only files despite being tagged
+/// `acodec=aac` by the extractor (`yt_dlp/extractor/tiktok.py` stamps the
+/// claim in `COMMON_FORMAT_INFO`, regardless of what TikTok's CDN actually
+/// muxes). We discard video frames during postprocessing, so the visible
+/// "watermarked" label on `download` has no effect on our output.
+///
+/// Fallbacks: best h264 (for videos where the creator has disabled
+/// download), then any best (defense against extractor changes).
+fn build_yt_dlp_args(video_id: &str, source_url: &str, video_dir: &Path) -> (Vec<String>, PathBuf) {
+    let output_template = format!("{}/{}.%(ext)s", video_dir.display(), video_id);
+    let wav_path = video_dir.join(format!("{}.wav", video_id));
+    let args = vec![
+        "--no-playlist".into(),
+        "--no-warnings".into(),
+        "--quiet".into(),
+        "-f".into(),
+        "download/b[vcodec=h264]/b".into(),
+        "-x".into(),
+        "--audio-format".into(),
+        "wav".into(),
+        "--postprocessor-args".into(),
+        "ffmpeg:-ar 16000 -ac 1".into(),
+        "-o".into(),
+        output_template,
+        source_url.to_string(),
+    ];
+    (args, wav_path)
+}
+
 #[async_trait]
 impl VideoFetcher for YtDlpFetcher {
     async fn acquire(&self, video_id: &str, source_url: &str) -> Result<Acquisition, FetchError> {
@@ -36,22 +73,7 @@ impl VideoFetcher for YtDlpFetcher {
             ))
         })?;
 
-        // Output template: write to {video_dir}/{video_id}.%(ext)s
-        let output_template = format!("{}/{}.%(ext)s", video_dir.display(), video_id);
-
-        let args = vec![
-            "--no-playlist".into(),
-            "--no-warnings".into(),
-            "--quiet".into(),
-            "-x".into(),
-            "--audio-format".into(),
-            "wav".into(),
-            "--postprocessor-args".into(),
-            "ffmpeg:-ar 16000 -ac 1".into(),
-            "-o".into(),
-            output_template,
-            source_url.to_string(),
-        ];
+        let (args, wav_path) = build_yt_dlp_args(video_id, source_url, &video_dir);
 
         let outcome = run(CommandSpec {
             program: "yt-dlp",
@@ -70,8 +92,6 @@ impl VideoFetcher for YtDlpFetcher {
             });
         }
 
-        // Expected output: {video_dir}/{video_id}.wav
-        let wav_path = video_dir.join(format!("{}.wav", video_id));
         if !wav_path.exists() {
             return Err(FetchError::ParseError(format!(
                 "yt-dlp succeeded but expected file {} not found",
@@ -84,5 +104,48 @@ impl VideoFetcher for YtDlpFetcher {
 
     fn name(&self) -> &'static str {
         "ytdlp"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_args_selects_download_format_first() {
+        let video_dir = PathBuf::from("/tmp/test-dir");
+        let (args, _) = build_yt_dlp_args("abc123", "https://example.com/v", &video_dir);
+
+        let f_idx = args
+            .iter()
+            .position(|a| a == "-f")
+            .expect("-f flag must be present");
+        assert_eq!(
+            args.get(f_idx + 1).map(String::as_str),
+            Some("download/b[vcodec=h264]/b"),
+            "selector must prefer TikTok's pre-muxed `download` static asset, \
+             fall back to best h264, then best — sidesteps yt-dlp #15891 \
+             bitrateInfo h265 muxing bug"
+        );
+    }
+
+    #[test]
+    fn build_args_enforces_audio_input_invariant() {
+        // AD0014: audio input is float32 PCM 16 kHz mono. The yt-dlp
+        // postprocessor enforces 16 kHz mono at the WAV-extraction boundary.
+        let video_dir = PathBuf::from("/tmp/test-dir");
+        let (args, _) = build_yt_dlp_args("abc123", "https://example.com/v", &video_dir);
+        assert!(
+            args.iter().any(|a| a == "ffmpeg:-ar 16000 -ac 1"),
+            "AD0014 audio invariant (16 kHz mono) must be enforced via \
+             yt-dlp's --postprocessor-args"
+        );
+    }
+
+    #[test]
+    fn build_args_wav_path_matches_output_template() {
+        let video_dir = PathBuf::from("/tmp/test-dir");
+        let (_, wav_path) = build_yt_dlp_args("xyz789", "https://example.com/v", &video_dir);
+        assert_eq!(wav_path, PathBuf::from("/tmp/test-dir/xyz789.wav"));
     }
 }
