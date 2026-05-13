@@ -1125,6 +1125,8 @@ might become useful for re-claiming a row.
 
 The selector workaround and the Epic 3 retry compose cleanly — prevention reduces the rate; retry catches the residual. Do NOT revert the selector when retry lands.
 
+**A10 verification (2026-05-13):** `--simulate --print "%(format_id)s"` sweep on the SRC workspace against the 20 unique URLs in `tests/fixtures/ddp/news_orgs/` confirmed the selector picks the `download` format on 20/20 — 100% hit rate. Fallback paths (`b[vcodec=h264]` and `b`) not exercised on news-org content. Expected to exercise on donor content where creators have disabled the share-button download in privacy settings; the fallback is still h264 and still smaller than the default selector, but the residual-gap retry work above becomes more important on that surface.
+
 **Bake-notes cross-reference:** `docs/SRC-BAKE-NOTES.md` § "Plan B Epic 3 findings surfaced during bake" — Finding 1 (now superseded by this entry).
 
 ---
